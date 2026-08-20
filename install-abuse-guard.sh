@@ -22,20 +22,37 @@ TIMER="/etc/systemd/system/abuse-guard-v34.timer"
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "[ERR] run as root" >&2; exit 1; }
 
-mkdir -p "$STATE_DIR" "$LOG_DIR"
-chmod 700 "$STATE_DIR"
+# -----------------------------------------------------------------------------
+# Upgrade / legacy cleanup
+# -----------------------------------------------------------------------------
+# Upgrade order is intentional:
+#   1) read Telegram settings from current/legacy files
+#   2) stop and remove legacy Abuse Guard units/files
+#   3) preserve the current V3.4 config if it already exists
+#   4) install/overwrite the current V3.4 agent + units
+# This makes repeated GitHub installs idempotent while preventing old timers
+# from continuing to scan and generate duplicate alerts.
 
-# Best-effort import Telegram settings from older Abuse Guard files without sourcing them.
 extract_old_value() {
   local names="$1" file line val
   for file in \
+    "$CONF" \
     /etc/abuse-guard.conf \
     /etc/abuse-guard-v3.conf \
+    /etc/abuse-guard-v30.conf \
+    /etc/abuse-guard-v31.conf \
+    /etc/abuse-guard-v32.conf \
     /etc/abuse-guard-v33.conf \
     /etc/default/abuse-guard \
     /usr/local/sbin/abuse-guard-v3 \
+    /usr/local/sbin/abuse-guard-v30 \
+    /usr/local/sbin/abuse-guard-v31 \
+    /usr/local/sbin/abuse-guard-v32 \
     /usr/local/sbin/abuse-guard-v33 \
     /usr/local/sbin/incus-podman-abuse-guard-v3 \
+    /usr/local/sbin/incus-podman-abuse-guard-v30 \
+    /usr/local/sbin/incus-podman-abuse-guard-v31 \
+    /usr/local/sbin/incus-podman-abuse-guard-v32 \
     /usr/local/sbin/incus-podman-abuse-guard-v33; do
     [[ -f "$file" ]] || continue
     line=$(grep -E -m1 "^(${names})=" "$file" 2>/dev/null || true)
@@ -49,14 +66,127 @@ extract_old_value() {
   return 1
 }
 
+MIGRATED_TOKEN=$(extract_old_value 'TELEGRAM_BOT_TOKEN|TG_BOT_TOKEN|BOT_TOKEN' || true)
+MIGRATED_CHAT=$(extract_old_value 'TELEGRAM_CHAT_ID|TG_CHAT_ID|CHAT_ID' || true)
+
+legacy_removed=()
+record_removed() {
+  legacy_removed+=("$1")
+}
+
+is_current_unit() {
+  case "$1" in
+    abuse-guard-v34.service|abuse-guard-v34.timer) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_legacy_unit_name() {
+  local l
+  l=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$l" in
+    *abuse*guard*.service|*abuse*guard*.timer|*incus*podman*guard*.service|*incus*podman*guard*.timer)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cleanup_legacy_units() {
+  local unit path
+
+  # First stop/disable every legacy unit known to systemd.
+  while read -r unit _; do
+    [[ -n "$unit" ]] || continue
+    is_current_unit "$unit" && continue
+    is_legacy_unit_name "$unit" || continue
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done < <(systemctl list-unit-files --no-legend 2>/dev/null || true)
+
+  # Remove custom legacy unit files/symlinks under /etc/systemd/system only.
+  # Do not touch distribution units under /usr/lib or /lib.
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    unit=${path##*/}
+    is_current_unit "$unit" && continue
+    is_legacy_unit_name "$unit" || continue
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    rm -f -- "$path"
+    record_removed "$path"
+  done < <(find /etc/systemd/system -maxdepth 3 \( -type f -o -type l \) \
+      \( -iname '*abuse*guard*.service' -o -iname '*abuse*guard*.timer' \
+         -o -iname '*incus*podman*guard*.service' -o -iname '*incus*podman*guard*.timer' \) \
+      -print 2>/dev/null || true)
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+}
+
+cleanup_legacy_files() {
+  local path base
+
+  # Old agents/scripts in /usr/local/sbin. Preserve the current V3.4 agent.
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ "$path" == "$AGENT" ]] && continue
+    rm -f -- "$path"
+    record_removed "$path"
+  done < <(find /usr/local/sbin -maxdepth 1 -type f \
+      \( -iname '*abuse*guard*' -o -iname '*incus*podman*guard*' \) \
+      -print 2>/dev/null || true)
+
+  # Old configuration files. Preserve the current V3.4 configuration.
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ "$path" == "$CONF" ]] && continue
+    rm -f -- "$path"
+    record_removed "$path"
+  done < <(find /etc -maxdepth 1 -type f \
+      \( -iname 'abuse-guard*.conf' -o -iname 'incus-podman-abuse-guard*.conf' \) \
+      -print 2>/dev/null || true)
+
+  if [[ -f /etc/default/abuse-guard ]]; then
+    rm -f -- /etc/default/abuse-guard
+    record_removed "/etc/default/abuse-guard"
+  fi
+
+  # Old cron launchers, if an earlier build used cron instead of a systemd timer.
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    rm -f -- "$path"
+    record_removed "$path"
+  done < <(find /etc/cron.d -maxdepth 1 -type f \
+      \( -iname '*abuse*guard*' -o -iname '*incus*podman*guard*' \) \
+      -print 2>/dev/null || true)
+
+  # Old state/log directories. Preserve only the current V3.4 directories.
+  for path in /var/lib/abuse-guard* /var/lib/incus-podman-abuse-guard*; do
+    [[ -e "$path" ]] || continue
+    [[ "$path" == "$STATE_DIR" ]] && continue
+    rm -rf -- "$path"
+    record_removed "$path"
+  done
+  for path in /var/log/abuse-guard* /var/log/incus-podman-abuse-guard*; do
+    [[ -e "$path" ]] || continue
+    [[ "$path" == "$LOG_DIR" ]] && continue
+    rm -rf -- "$path"
+    record_removed "$path"
+  done
+}
+
+cleanup_legacy_units
+cleanup_legacy_files
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+chmod 700 "$STATE_DIR"
+
+# Preserve an existing V3.4 config on repeated installs. If absent, create it
+# with Telegram values migrated before the legacy files were removed.
 if [[ ! -f "$CONF" ]]; then
-  OLD_TOKEN=$(extract_old_value 'TELEGRAM_BOT_TOKEN|TG_BOT_TOKEN|BOT_TOKEN' || true)
-  OLD_CHAT=$(extract_old_value 'TELEGRAM_CHAT_ID|TG_CHAT_ID|CHAT_ID' || true)
   cat > "$CONF" <<CFG
 # Abuse Guard V3.4 configuration
 # Leave Telegram values empty to disable Telegram alerts.
-TELEGRAM_BOT_TOKEN=${OLD_TOKEN:-}
-TELEGRAM_CHAT_ID=${OLD_CHAT:-}
+TELEGRAM_BOT_TOKEN=${MIGRATED_TOKEN:-}
+TELEGRAM_CHAT_ID=${MIGRATED_CHAT:-}
 
 # Suppress identical unresolved-risk alerts for this many seconds.
 NOTIFY_COOLDOWN=21600
@@ -64,8 +194,8 @@ NOTIFY_COOLDOWN=21600
 # Timer interval. Installer writes the systemd timer separately; this is informational.
 SCAN_INTERVAL=2m
 CFG
-  chmod 600 "$CONF"
 fi
+chmod 600 "$CONF"
 
 cat > "$AGENT" <<'AGENT_EOF'
 #!/usr/bin/env bash
@@ -657,24 +787,18 @@ Unit=abuse-guard-v34.service
 WantedBy=timers.target
 EOF
 
-# Disable legacy Abuse Guard units to avoid duplicate scanning/noise.
-while read -r unit _; do
-  [[ -n "$unit" ]] || continue
-  [[ "$unit" == abuse-guard-v34.service || "$unit" == abuse-guard-v34.timer ]] && continue
-  case "$unit" in
-    *abuse*guard*|*Abuse*Guard*|*incus*podman*guard*)
-      systemctl disable --now "$unit" >/dev/null 2>&1 || true
-      ;;
-  esac
-done < <(systemctl list-unit-files --no-legend 2>/dev/null || true)
-
 systemctl daemon-reload
 systemctl enable --now abuse-guard-v34.timer
 
 # Syntax-check the installed scanner.
 bash -n "$AGENT"
 
-echo "[OK] Abuse Guard V3.4 installed"
+echo "[OK] Abuse Guard V3.4 installed / updated"
+if (( ${#legacy_removed[@]} > 0 )); then
+  echo "     Legacy: removed ${#legacy_removed[@]} old file(s)/state item(s)"
+else
+  echo "     Legacy: no old Abuse Guard files found"
+fi
 echo "     Agent : $AGENT"
 echo "     Config: $CONF"
 echo "     Timer : abuse-guard-v34.timer (every 2 minutes)"
