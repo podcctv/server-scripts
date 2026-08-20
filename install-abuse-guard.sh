@@ -192,8 +192,14 @@ TELEGRAM_CHAT_ID=${MIGRATED_CHAT:-}
 NOTIFY_COOLDOWN=21600
 
 # Timer interval. Installer writes the systemd timer separately; this is informational.
-SCAN_INTERVAL=2m
+SCAN_INTERVAL=1h
 CFG
+fi
+# Keep an existing V3.4 config aligned with the new hourly schedule.
+if grep -q '^SCAN_INTERVAL=' "$CONF" 2>/dev/null; then
+  sed -i 's/^SCAN_INTERVAL=.*/SCAN_INTERVAL=1h/' "$CONF"
+else
+  printf '\nSCAN_INTERVAL=1h\n' >> "$CONF"
 fi
 chmod 600 "$CONF"
 
@@ -754,6 +760,13 @@ AGENT_EOF
 
 chmod 750 "$AGENT"
 
+# Stop the old schedule before replacing the unit files.
+# This is important when upgrading from the old 2-minute timer: otherwise the
+# existing timer can retrigger the scanner while the installer is updating it.
+systemctl disable --now abuse-guard-v34.timer >/dev/null 2>&1 || true
+systemctl stop abuse-guard-v34.service >/dev/null 2>&1 || true
+systemctl reset-failed abuse-guard-v34.service >/dev/null 2>&1 || true
+
 cat > "$SERVICE" <<EOF
 [Unit]
 Description=Abuse Guard V3.4 - Incus/Podman Debian/Alpine scanner
@@ -764,9 +777,15 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$AGENT
 User=root
+
+# Keep the scanner low priority. It is a periodic maintenance job, not a daemon.
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+
+# A broken/slow scan must not remain active forever.
+TimeoutStartSec=45min
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
@@ -774,13 +793,20 @@ EOF
 
 cat > "$TIMER" <<'EOF'
 [Unit]
-Description=Run Abuse Guard V3.4 periodically
+Description=Run Abuse Guard V3.4 once per hour
 
 [Timer]
-OnBootSec=90s
-OnUnitActiveSec=2min
-AccuracySec=20s
-Persistent=false
+# First scan shortly after boot.
+OnBootSec=5min
+
+# IMPORTANT:
+# Schedule from the END of the previous scan, not from its start.
+# Therefore a slow scan can never turn into back-to-back continuous scanning.
+OnUnitInactiveSec=1h
+
+# Exact-to-the-second execution is unnecessary for this maintenance task.
+AccuracySec=1min
+
 Unit=abuse-guard-v34.service
 
 [Install]
@@ -801,7 +827,7 @@ else
 fi
 echo "     Agent : $AGENT"
 echo "     Config: $CONF"
-echo "     Timer : abuse-guard-v34.timer (every 2 minutes)"
+echo "     Timer : abuse-guard-v34.timer (1 hour after the previous scan finishes)"
 echo ""
 echo "Scope: Incus + root Podman, running Debian/Alpine containers only; Docker ignored."
 echo "Allow: x-ui / 3x-ui / sing-box are not cleanup targets."
