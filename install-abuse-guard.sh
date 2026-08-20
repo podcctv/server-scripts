@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Abuse Guard V3.4
+# Abuse Guard V3.5
 # Scope:
 #   - Incus containers: Debian / Alpine only
 #   - root Podman containers: Debian / Alpine only
@@ -12,13 +12,20 @@ set -Eeuo pipefail
 #   - Explicitly do NOT target x-ui / 3x-ui / sing-box
 #   - No generic systemd runtime-diff tracking; notifications contain only confirmed risk evidence
 
-VERSION="3.4"
-AGENT="/usr/local/sbin/abuse-guard-v34"
-CONF="/etc/abuse-guard-v34.conf"
-STATE_DIR="/var/lib/abuse-guard-v34"
-LOG_DIR="/var/log/abuse-guard-v34"
-SERVICE="/etc/systemd/system/abuse-guard-v34.service"
-TIMER="/etc/systemd/system/abuse-guard-v34.timer"
+VERSION="3.5"
+AGENT="/usr/local/sbin/abuse-guard-v35"
+CONF="/etc/abuse-guard-v35.conf"
+STATE_DIR="/var/lib/abuse-guard-v35"
+LOG_DIR="/var/log/abuse-guard-v35"
+SERVICE="/etc/systemd/system/abuse-guard-v35.service"
+TIMER="/etc/systemd/system/abuse-guard-v35.timer"
+
+# Automatic installer update
+UPDATE_SOURCE_URL="https://raw.githubusercontent.com/podcctv/server-scripts/refs/heads/main/install-abuse-guard.sh"
+UPDATER="/usr/local/sbin/abuse-guard-auto-update"
+UPDATE_SERVICE="/etc/systemd/system/abuse-guard-auto-update.service"
+UPDATE_TIMER="/etc/systemd/system/abuse-guard-auto-update.timer"
+UPDATE_HASH_FILE="$STATE_DIR/installer.sha256"
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "[ERR] run as root" >&2; exit 1; }
 
@@ -28,8 +35,8 @@ TIMER="/etc/systemd/system/abuse-guard-v34.timer"
 # Upgrade order is intentional:
 #   1) read Telegram settings from current/legacy files
 #   2) stop and remove legacy Abuse Guard units/files
-#   3) preserve the current V3.4 config if it already exists
-#   4) install/overwrite the current V3.4 agent + units
+#   3) preserve the current V3.5 config if it already exists
+#   4) install/overwrite the current V3.5 agent + units
 # This makes repeated GitHub installs idempotent while preventing old timers
 # from continuing to scan and generate duplicate alerts.
 
@@ -43,17 +50,20 @@ extract_old_value() {
     /etc/abuse-guard-v31.conf \
     /etc/abuse-guard-v32.conf \
     /etc/abuse-guard-v33.conf \
+    /etc/abuse-guard-v34.conf \
     /etc/default/abuse-guard \
     /usr/local/sbin/abuse-guard-v3 \
     /usr/local/sbin/abuse-guard-v30 \
     /usr/local/sbin/abuse-guard-v31 \
     /usr/local/sbin/abuse-guard-v32 \
     /usr/local/sbin/abuse-guard-v33 \
+    /usr/local/sbin/abuse-guard-v34 \
     /usr/local/sbin/incus-podman-abuse-guard-v3 \
     /usr/local/sbin/incus-podman-abuse-guard-v30 \
     /usr/local/sbin/incus-podman-abuse-guard-v31 \
     /usr/local/sbin/incus-podman-abuse-guard-v32 \
-    /usr/local/sbin/incus-podman-abuse-guard-v33; do
+    /usr/local/sbin/incus-podman-abuse-guard-v33 \
+    /usr/local/sbin/incus-podman-abuse-guard-v34; do
     [[ -f "$file" ]] || continue
     line=$(grep -E -m1 "^(${names})=" "$file" 2>/dev/null || true)
     [[ -n "$line" ]] || continue
@@ -68,6 +78,7 @@ extract_old_value() {
 
 MIGRATED_TOKEN=$(extract_old_value 'TELEGRAM_BOT_TOKEN|TG_BOT_TOKEN|BOT_TOKEN' || true)
 MIGRATED_CHAT=$(extract_old_value 'TELEGRAM_CHAT_ID|TG_CHAT_ID|CHAT_ID' || true)
+MIGRATED_COOLDOWN=$(extract_old_value 'NOTIFY_COOLDOWN' || true)
 
 legacy_removed=()
 record_removed() {
@@ -76,7 +87,7 @@ record_removed() {
 
 is_current_unit() {
   case "$1" in
-    abuse-guard-v34.service|abuse-guard-v34.timer) return 0 ;;
+    abuse-guard-v35.service|abuse-guard-v35.timer|abuse-guard-auto-update.service|abuse-guard-auto-update.timer) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -124,17 +135,18 @@ cleanup_legacy_units() {
 cleanup_legacy_files() {
   local path base
 
-  # Old agents/scripts in /usr/local/sbin. Preserve the current V3.4 agent.
+  # Old agents/scripts in /usr/local/sbin. Preserve the current V3.5 agent.
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     [[ "$path" == "$AGENT" ]] && continue
+    [[ "$path" == "$UPDATER" ]] && continue
     rm -f -- "$path"
     record_removed "$path"
   done < <(find /usr/local/sbin -maxdepth 1 -type f \
       \( -iname '*abuse*guard*' -o -iname '*incus*podman*guard*' \) \
       -print 2>/dev/null || true)
 
-  # Old configuration files. Preserve the current V3.4 configuration.
+  # Old configuration files. Preserve the current V3.5 configuration.
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     [[ "$path" == "$CONF" ]] && continue
@@ -158,7 +170,7 @@ cleanup_legacy_files() {
       \( -iname '*abuse*guard*' -o -iname '*incus*podman*guard*' \) \
       -print 2>/dev/null || true)
 
-  # Old state/log directories. Preserve only the current V3.4 directories.
+  # Old state/log directories. Preserve only the current V3.5 directories.
   for path in /var/lib/abuse-guard* /var/lib/incus-podman-abuse-guard*; do
     [[ -e "$path" ]] || continue
     [[ "$path" == "$STATE_DIR" ]] && continue
@@ -179,39 +191,52 @@ cleanup_legacy_files
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 chmod 700 "$STATE_DIR"
 
-# Preserve an existing V3.4 config on repeated installs. If absent, create it
+# Preserve an existing V3.5 config on repeated installs. If absent, create it
 # with Telegram values migrated before the legacy files were removed.
 if [[ ! -f "$CONF" ]]; then
   cat > "$CONF" <<CFG
-# Abuse Guard V3.4 configuration
+# Abuse Guard V3.5 configuration
 # Leave Telegram values empty to disable Telegram alerts.
 TELEGRAM_BOT_TOKEN=${MIGRATED_TOKEN:-}
 TELEGRAM_CHAT_ID=${MIGRATED_CHAT:-}
 
 # Suppress identical unresolved-risk alerts for this many seconds.
-NOTIFY_COOLDOWN=21600
+NOTIFY_COOLDOWN=${MIGRATED_COOLDOWN:-21600}
 
-# Timer interval. Installer writes the systemd timer separately; this is informational.
+# Scanner schedule. The scanner is NOT resident; it runs once, exits, then waits one hour.
 SCAN_INTERVAL=1h
+
+# Automatic installer update.
+AUTO_UPDATE=true
+UPDATE_CHECK_INTERVAL=24h
+UPDATE_SOURCE_URL=${UPDATE_SOURCE_URL}
 CFG
 fi
-# Keep an existing V3.4 config aligned with the new hourly schedule.
-if grep -q '^SCAN_INTERVAL=' "$CONF" 2>/dev/null; then
-  sed -i 's/^SCAN_INTERVAL=.*/SCAN_INTERVAL=1h/' "$CONF"
-else
-  printf '\nSCAN_INTERVAL=1h\n' >> "$CONF"
-fi
+# Keep an existing V3.5 config aligned with the current schedules/settings.
+upsert_conf() {
+  local key=$1 value=$2
+  if grep -q "^${key}=" "$CONF" 2>/dev/null; then
+    sed -i "s#^${key}=.*#${key}=${value}#" "$CONF"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$CONF"
+  fi
+}
+
+upsert_conf SCAN_INTERVAL "1h"
+upsert_conf AUTO_UPDATE "true"
+upsert_conf UPDATE_CHECK_INTERVAL "24h"
+upsert_conf UPDATE_SOURCE_URL "$UPDATE_SOURCE_URL"
 chmod 600 "$CONF"
 
 cat > "$AGENT" <<'AGENT_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="3.4"
-CONF="/etc/abuse-guard-v34.conf"
-STATE_DIR="/var/lib/abuse-guard-v34"
+VERSION="3.5"
+CONF="/etc/abuse-guard-v35.conf"
+STATE_DIR="/var/lib/abuse-guard-v35"
 STATE_FILE="$STATE_DIR/notify-state.tsv"
-LOCK_FILE="/run/abuse-guard-v34.lock"
+LOCK_FILE="/run/abuse-guard-v35.lock"
 
 mkdir -p "$STATE_DIR"
 touch "$STATE_FILE"
@@ -427,7 +452,7 @@ scan_processes() {
 
     # Scanner plumbing itself is never a target.
     case "$args" in
-      *abuse-guard-v34*|*"ps -eo pid"*) continue ;;
+      *abuse-guard-v35*|*"ps -eo pid"*) continue ;;
     esac
 
     class=$(risk_class "$fam")
@@ -760,16 +785,149 @@ AGENT_EOF
 
 chmod 750 "$AGENT"
 
+cat > "$UPDATER" <<'UPDATER_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONF="/etc/abuse-guard-v35.conf"
+STATE_DIR="/var/lib/abuse-guard-v35"
+HASH_FILE="$STATE_DIR/installer.sha256"
+LOCK_FILE="/run/abuse-guard-auto-update.lock"
+CACHE_FILE="$STATE_DIR/install-abuse-guard.latest.sh"
+
+DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/podcctv/server-scripts/refs/heads/main/install-abuse-guard.sh"
+CURRENT_VERSION="3.5"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# shellcheck disable=SC1090
+[[ -f "$CONF" ]] && . "$CONF"
+AUTO_UPDATE=${AUTO_UPDATE:-true}
+UPDATE_SOURCE_URL=${UPDATE_SOURCE_URL:-$DEFAULT_SOURCE_URL}
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+case "${AUTO_UPDATE,,}" in
+  1|yes|true|on) ;;
+  *)
+    log "auto-update disabled in $CONF"
+    exit 0
+    ;;
+esac
+
+# Never allow overlapping update checks.
+exec 9>"$LOCK_FILE"
+flock -n 9 || {
+  log "another update check is already running; exit"
+  exit 0
+}
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+download() {
+  local url=$1 out=$2
+  case "$url" in
+    https://raw.githubusercontent.com/*) ;;
+    *)
+      log "refuse non-approved update source: $url"
+      return 1
+      ;;
+  esac
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --proto '=https' --tlsv1.2 \
+      --connect-timeout 15 --max-time 120 \
+      --retry 2 --retry-delay 3 \
+      -o "$out" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --https-only --timeout=120 --tries=3 -O "$out" "$url"
+  else
+    log "curl/wget not found; cannot check updates"
+    return 1
+  fi
+}
+
+log "checking installer source: $UPDATE_SOURCE_URL"
+download "$UPDATE_SOURCE_URL" "$tmp"
+
+# Basic safety/integrity checks before execution.
+[[ -s "$tmp" ]] || {
+  log "downloaded installer is empty"
+  exit 1
+}
+
+bash -n "$tmp" || {
+  log "remote installer failed bash syntax check"
+  exit 1
+}
+
+grep -qE 'Abuse Guard|abuse-guard' "$tmp" || {
+  log "remote file does not look like an Abuse Guard installer"
+  exit 1
+}
+
+# Never automatically downgrade to an older installer version.
+# Same-version hash changes are allowed so hotfixes can be deployed without a version bump.
+remote_version=$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n 1)
+[[ -n "$remote_version" ]] || {
+  log "remote installer has no readable VERSION; refuse auto-update"
+  exit 1
+}
+
+version_lt() {
+  local a=$1 b=$2 first
+  [[ "$a" == "$b" ]] && return 1
+  first=$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n 1)
+  [[ "$first" == "$a" ]]
+}
+
+if version_lt "$remote_version" "$CURRENT_VERSION"; then
+  log "remote version $remote_version is older than installed $CURRENT_VERSION; refuse downgrade"
+  exit 0
+fi
+
+new_hash=$(sha256sum "$tmp" | awk '{print $1}')
+old_hash=$(cat "$HASH_FILE" 2>/dev/null || true)
+
+if [[ -n "$old_hash" && "$new_hash" == "$old_hash" ]]; then
+  log "installer unchanged sha256=$new_hash"
+  exit 0
+fi
+
+log "installer update detected old=${old_hash:-none} new=$new_hash"
+
+# Keep a local copy of the exact installer being applied.
+install -m 0750 "$tmp" "$CACHE_FILE"
+
+# Run the downloaded installer only after all checks pass.
+# The installer itself stops/replaces the old scanner timer safely.
+if bash "$CACHE_FILE"; then
+  printf '%s\n' "$new_hash" > "$HASH_FILE"
+  chmod 600 "$HASH_FILE"
+  log "automatic update applied successfully sha256=$new_hash"
+else
+  rc=$?
+  log "automatic update failed rc=$rc; hash not advanced, will retry later"
+  exit "$rc"
+fi
+UPDATER_EOF
+
+chmod 750 "$UPDATER"
+
 # Stop the old schedule before replacing the unit files.
 # This is important when upgrading from the old 2-minute timer: otherwise the
 # existing timer can retrigger the scanner while the installer is updating it.
-systemctl disable --now abuse-guard-v34.timer >/dev/null 2>&1 || true
-systemctl stop abuse-guard-v34.service >/dev/null 2>&1 || true
-systemctl reset-failed abuse-guard-v34.service >/dev/null 2>&1 || true
+systemctl disable --now abuse-guard-v35.timer >/dev/null 2>&1 || true
+systemctl stop abuse-guard-v35.service >/dev/null 2>&1 || true
+systemctl reset-failed abuse-guard-v35.service >/dev/null 2>&1 || true
 
 cat > "$SERVICE" <<EOF
 [Unit]
-Description=Abuse Guard V3.4 - Incus/Podman Debian/Alpine scanner
+Description=Abuse Guard V3.5 - Incus/Podman Debian/Alpine scanner
 After=network-online.target
 Wants=network-online.target
 
@@ -793,7 +951,7 @@ EOF
 
 cat > "$TIMER" <<'EOF'
 [Unit]
-Description=Run Abuse Guard V3.4 once per hour
+Description=Run Abuse Guard V3.5 once per hour
 
 [Timer]
 # First scan shortly after boot.
@@ -807,19 +965,65 @@ OnUnitInactiveSec=1h
 # Exact-to-the-second execution is unnecessary for this maintenance task.
 AccuracySec=1min
 
-Unit=abuse-guard-v34.service
+Unit=abuse-guard-v35.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > "$UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Abuse Guard - check installer source and auto-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$UPDATER
+User=root
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=15min
+KillMode=control-group
+EOF
+
+cat > "$UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=Check Abuse Guard installer source every 24 hours
+
+[Timer]
+# Do not compete with boot workloads.
+OnBootSec=15min
+
+# Check again 24 hours after the previous check finishes.
+OnUnitInactiveSec=24h
+AccuracySec=10min
+
+Unit=abuse-guard-auto-update.service
 
 [Install]
 WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now abuse-guard-v34.timer
+systemctl enable --now abuse-guard-v35.timer
+systemctl enable --now abuse-guard-auto-update.timer
 
-# Syntax-check the installed scanner.
+# Syntax-check installed scripts.
 bash -n "$AGENT"
+bash -n "$UPDATER"
 
-echo "[OK] Abuse Guard V3.4 installed / updated"
+# Seed the updater hash with this installer when it is a normal readable file.
+# If installed through a pipe/process substitution, the first scheduled updater
+# run will safely establish/apply the remote source instead.
+if [[ -f "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]]; then
+  SELF_HASH=$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')
+  printf '%s\n' "$SELF_HASH" > "$UPDATE_HASH_FILE"
+  chmod 600 "$UPDATE_HASH_FILE"
+fi
+
+echo "[OK] Abuse Guard V3.5 installed / updated"
 if (( ${#legacy_removed[@]} > 0 )); then
   echo "     Legacy: removed ${#legacy_removed[@]} old file(s)/state item(s)"
 else
@@ -827,12 +1031,16 @@ else
 fi
 echo "     Agent : $AGENT"
 echo "     Config: $CONF"
-echo "     Timer : abuse-guard-v34.timer (1 hour after the previous scan finishes)"
+echo "     Scan  : abuse-guard-v35.timer (1 hour after the previous scan finishes)"
+echo "     Update: abuse-guard-auto-update.timer (24 hours after the previous check finishes)"
+echo "     Source: $UPDATE_SOURCE_URL"
 echo ""
 echo "Scope: Incus + root Podman, running Debian/Alpine containers only; Docker ignored."
 echo "Allow: x-ui / 3x-ui / sing-box are not cleanup targets."
 echo "Clean: airport/node panels, Nezha agent/dashboard, exact board, known miners/malware."
 echo "Packet: active hping3/masscan/zmap/nping processes or persistence are stopped/removed; package binaries are not deleted."
 echo ""
-echo "Test once: systemctl start abuse-guard-v34.service"
-echo "Logs     : journalctl -u abuse-guard-v34.service -n 100 --no-pager"
+echo "Test scan  : systemctl start abuse-guard-v35.service"
+echo "Test update: systemctl start abuse-guard-auto-update.service"
+echo "Scan logs  : journalctl -u abuse-guard-v35.service -n 100 --no-pager"
+echo "Update logs: journalctl -u abuse-guard-auto-update.service -n 100 --no-pager"
