@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Abuse Guard V3.5
+# Abuse Guard V3.6
 # Scope:
 #   - Incus containers: Debian / Alpine only
 #   - root Podman containers: Debian / Alpine only
@@ -12,20 +12,22 @@ set -Eeuo pipefail
 #   - Explicitly do NOT target x-ui / 3x-ui / sing-box
 #   - No generic systemd runtime-diff tracking; notifications contain only confirmed risk evidence
 
-VERSION="3.5"
-AGENT="/usr/local/sbin/abuse-guard-v35"
-CONF="/etc/abuse-guard-v35.conf"
-STATE_DIR="/var/lib/abuse-guard-v35"
-LOG_DIR="/var/log/abuse-guard-v35"
-SERVICE="/etc/systemd/system/abuse-guard-v35.service"
-TIMER="/etc/systemd/system/abuse-guard-v35.timer"
+VERSION="3.6"
+AGENT="/usr/local/sbin/abuse-guard-v36"
+CURRENT_LINK="/usr/local/sbin/abuse-guard"
+CONF="/etc/abuse-guard-v36.conf"
+STATE_DIR="/var/lib/abuse-guard-v36"
+LOG_DIR="/var/log/abuse-guard-v36"
+SERVICE="/etc/systemd/system/abuse-guard-v36.service"
+TIMER="/etc/systemd/system/abuse-guard-v36.timer"
 
 # Automatic installer update
 UPDATE_SOURCE_URL="https://raw.githubusercontent.com/podcctv/server-scripts/refs/heads/main/install-abuse-guard.sh"
 UPDATER="/usr/local/sbin/abuse-guard-auto-update"
 UPDATE_SERVICE="/etc/systemd/system/abuse-guard-auto-update.service"
 UPDATE_TIMER="/etc/systemd/system/abuse-guard-auto-update.timer"
-UPDATE_HASH_FILE="$STATE_DIR/installer.sha256"
+UPDATE_STATE_DIR="/var/lib/abuse-guard-updater"
+UPDATE_HASH_FILE="$UPDATE_STATE_DIR/installer.sha256"
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "[ERR] run as root" >&2; exit 1; }
 
@@ -35,8 +37,8 @@ UPDATE_HASH_FILE="$STATE_DIR/installer.sha256"
 # Upgrade order is intentional:
 #   1) read Telegram settings from current/legacy files
 #   2) stop and remove legacy Abuse Guard units/files
-#   3) preserve the current V3.5 config if it already exists
-#   4) install/overwrite the current V3.5 agent + units
+#   3) preserve the current V3.6 config if it already exists
+#   4) install/overwrite the current V3.6 agent + units
 # This makes repeated GitHub installs idempotent while preventing old timers
 # from continuing to scan and generate duplicate alerts.
 
@@ -51,6 +53,7 @@ extract_old_value() {
     /etc/abuse-guard-v32.conf \
     /etc/abuse-guard-v33.conf \
     /etc/abuse-guard-v34.conf \
+    /etc/abuse-guard-v35.conf \
     /etc/default/abuse-guard \
     /usr/local/sbin/abuse-guard-v3 \
     /usr/local/sbin/abuse-guard-v30 \
@@ -58,12 +61,14 @@ extract_old_value() {
     /usr/local/sbin/abuse-guard-v32 \
     /usr/local/sbin/abuse-guard-v33 \
     /usr/local/sbin/abuse-guard-v34 \
+    /usr/local/sbin/abuse-guard-v35 \
     /usr/local/sbin/incus-podman-abuse-guard-v3 \
     /usr/local/sbin/incus-podman-abuse-guard-v30 \
     /usr/local/sbin/incus-podman-abuse-guard-v31 \
     /usr/local/sbin/incus-podman-abuse-guard-v32 \
     /usr/local/sbin/incus-podman-abuse-guard-v33 \
-    /usr/local/sbin/incus-podman-abuse-guard-v34; do
+    /usr/local/sbin/incus-podman-abuse-guard-v34 \
+    /usr/local/sbin/incus-podman-abuse-guard-v35; do
     [[ -f "$file" ]] || continue
     line=$(grep -E -m1 "^(${names})=" "$file" 2>/dev/null || true)
     [[ -n "$line" ]] || continue
@@ -87,7 +92,7 @@ record_removed() {
 
 is_current_unit() {
   case "$1" in
-    abuse-guard-v35.service|abuse-guard-v35.timer|abuse-guard-auto-update.service|abuse-guard-auto-update.timer) return 0 ;;
+    abuse-guard-v36.service|abuse-guard-v36.timer|abuse-guard-auto-update.service|abuse-guard-auto-update.timer) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -135,7 +140,7 @@ cleanup_legacy_units() {
 cleanup_legacy_files() {
   local path base
 
-  # Old agents/scripts in /usr/local/sbin. Preserve the current V3.5 agent.
+  # Old agents/scripts in /usr/local/sbin. Preserve the current V3.6 agent.
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     [[ "$path" == "$AGENT" ]] && continue
@@ -146,7 +151,7 @@ cleanup_legacy_files() {
       \( -iname '*abuse*guard*' -o -iname '*incus*podman*guard*' \) \
       -print 2>/dev/null || true)
 
-  # Old configuration files. Preserve the current V3.5 configuration.
+  # Old configuration files. Preserve the current V3.6 configuration.
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     [[ "$path" == "$CONF" ]] && continue
@@ -170,10 +175,11 @@ cleanup_legacy_files() {
       \( -iname '*abuse*guard*' -o -iname '*incus*podman*guard*' \) \
       -print 2>/dev/null || true)
 
-  # Old state/log directories. Preserve only the current V3.5 directories.
+  # Old state/log directories. Preserve only the current V3.6 directories.
   for path in /var/lib/abuse-guard* /var/lib/incus-podman-abuse-guard*; do
     [[ -e "$path" ]] || continue
     [[ "$path" == "$STATE_DIR" ]] && continue
+    [[ "$path" == "$UPDATE_STATE_DIR" ]] && continue
     rm -rf -- "$path"
     record_removed "$path"
   done
@@ -188,14 +194,14 @@ cleanup_legacy_files() {
 cleanup_legacy_units
 cleanup_legacy_files
 
-mkdir -p "$STATE_DIR" "$LOG_DIR"
-chmod 700 "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$UPDATE_STATE_DIR"
+chmod 700 "$STATE_DIR" "$UPDATE_STATE_DIR"
 
-# Preserve an existing V3.5 config on repeated installs. If absent, create it
+# Preserve an existing V3.6 config on repeated installs. If absent, create it
 # with Telegram values migrated before the legacy files were removed.
 if [[ ! -f "$CONF" ]]; then
   cat > "$CONF" <<CFG
-# Abuse Guard V3.5 configuration
+# Abuse Guard V3.6 configuration
 # Leave Telegram values empty to disable Telegram alerts.
 TELEGRAM_BOT_TOKEN=${MIGRATED_TOKEN:-}
 TELEGRAM_CHAT_ID=${MIGRATED_CHAT:-}
@@ -206,13 +212,16 @@ NOTIFY_COOLDOWN=${MIGRATED_COOLDOWN:-21600}
 # Scanner schedule. The scanner is NOT resident; it runs once, exits, then waits one hour.
 SCAN_INTERVAL=1h
 
+# Hard timeout for one container exec/snapshot operation, in seconds.
+CONTAINER_EXEC_TIMEOUT=120
+
 # Automatic installer update.
 AUTO_UPDATE=true
 UPDATE_CHECK_INTERVAL=24h
 UPDATE_SOURCE_URL=${UPDATE_SOURCE_URL}
 CFG
 fi
-# Keep an existing V3.5 config aligned with the current schedules/settings.
+# Keep an existing V3.6 config aligned with the current schedules/settings.
 upsert_conf() {
   local key=$1 value=$2
   if grep -q "^${key}=" "$CONF" 2>/dev/null; then
@@ -223,6 +232,7 @@ upsert_conf() {
 }
 
 upsert_conf SCAN_INTERVAL "1h"
+upsert_conf CONTAINER_EXEC_TIMEOUT "120"
 upsert_conf AUTO_UPDATE "true"
 upsert_conf UPDATE_CHECK_INTERVAL "24h"
 upsert_conf UPDATE_SOURCE_URL "$UPDATE_SOURCE_URL"
@@ -232,11 +242,19 @@ cat > "$AGENT" <<'AGENT_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="3.5"
-CONF="/etc/abuse-guard-v35.conf"
-STATE_DIR="/var/lib/abuse-guard-v35"
+VERSION="3.6"
+CONF="/etc/abuse-guard-v36.conf"
+STATE_DIR="/var/lib/abuse-guard-v36"
 STATE_FILE="$STATE_DIR/notify-state.tsv"
-LOCK_FILE="/run/abuse-guard-v35.lock"
+LOCK_FILE="/run/abuse-guard-v36.lock"
+
+# Version query must work without touching system state.
+case "${1:-}" in
+  --version|-V|version)
+    printf 'Abuse Guard V%s\n' "$VERSION"
+    exit 0
+    ;;
+esac
 
 mkdir -p "$STATE_DIR"
 touch "$STATE_FILE"
@@ -248,9 +266,10 @@ chmod 600 "$STATE_FILE"
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
 NOTIFY_COOLDOWN=${NOTIFY_COOLDOWN:-21600}
+CONTAINER_EXEC_TIMEOUT=${CONTAINER_EXEC_TIMEOUT:-120}
 HOST_NAME=$(hostname 2>/dev/null || printf unknown)
 
-# One scanner at a time.
+# One scanner at a time. There is no resident monitoring loop in this program.
 exec 9>"$LOCK_FILE"
 flock -n 9 || exit 0
 
@@ -259,13 +278,11 @@ log() {
 }
 
 # Explicit high-risk families. x-ui / 3x-ui / sing-box are intentionally absent.
-# 'board' is intentionally supported, but with stricter matching than the other names.
 family_of() {
-  local s l
+  local s l n
   s=${1:-}
   l=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
 
-  # Most specific first.
   if [[ $l =~ (^|[[:space:]/_.:@-])nezha-dashboard([[:space:]/_.:@-]|$) ]]; then echo nezha-dashboard; return 0; fi
   if [[ $l =~ (^|[[:space:]/_.:@-])nezha-agent([[:space:]/_.:@-]|$) ]]; then echo nezha-agent; return 0; fi
   if [[ $l =~ (^|[[:space:]/_.:@-])marzban-node([[:space:]/_.:@-]|$) ]]; then echo marzban-node; return 0; fi
@@ -277,18 +294,16 @@ family_of() {
   if [[ $l =~ (^|[[:space:]/_.:@-])xmrig-proxy([[:space:]/_.:@-]|$) ]]; then echo xmrig-proxy; return 0; fi
   if [[ $l =~ (^|[[:space:]/_.:@-])cpuminer-multi([[:space:]/_.:@-]|$) ]]; then echo cpuminer-multi; return 0; fi
 
-  local n
   for n in \
     v2bx xrayr marzban hiddify v2board xboard ss-panel sspanel ssmgr \
     xmrig cpuminer minerd ethminer nbminer lolminer t-rex kdevtmpfsi kinsing watchbog skidmap \
-    xorddos muhsTik mirai tsunami gafgyt mozi; do
-    n=$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]')
+    xorddos muhstik mirai tsunami gafgyt mozi; do
     if [[ $l =~ (^|[[:space:]/_.:@-])${n}([[:space:]/_.:@-]|$) ]]; then
       echo "$n"; return 0
     fi
   done
 
-  # 'board' is deliberately strict: do not match dashboard, keyboard, board-api, etc.
+  # Strict generic "board" matching only.
   if [[ $l =~ (^|[[:space:]/_.:@])board([[:space:]/_.:@]|$) ]]; then
     echo board; return 0
   fi
@@ -324,16 +339,40 @@ risk_class() {
   esac
 }
 
-# container_sh runtime container command [args...]
+add_finding() {
+  local file=$1 class=$2 family=$3 kind=$4 detail=$5
+  detail=${detail//$'\n'/ }
+  detail=${detail//|/¦}
+  printf '%s|%s|%s|%s\n' "$class" "$family" "$kind" "$detail" >> "$file"
+}
+
+plan_add() {
+  local file=$1 record=$2
+  [[ "$record" != *$'\n'* ]] || return 0
+  printf '%s\n' "$record" >> "$file"
+}
+
+# One exec call per payload, with a hard timeout.
 container_sh() {
   local runtime=$1 container=$2 code=$3
   shift 3
+
   case "$runtime" in
     incus)
-      incus exec "$container" -- sh -c "$code" sh "$@"
+      if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground "${CONTAINER_EXEC_TIMEOUT}s" \
+          incus exec "$container" -- sh -c "$code" sh "$@"
+      else
+        incus exec "$container" -- sh -c "$code" sh "$@"
+      fi
       ;;
     podman)
-      podman exec "$container" sh -c "$code" sh "$@"
+      if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground "${CONTAINER_EXEC_TIMEOUT}s" \
+          podman exec "$container" sh -c "$code" sh "$@"
+      else
+        podman exec "$container" sh -c "$code" sh "$@"
+      fi
       ;;
     *)
       return 127
@@ -341,144 +380,132 @@ container_sh() {
   esac
 }
 
-container_os() {
-  local runtime=$1 container=$2 id
-  id=$(container_sh "$runtime" "$container" '. /etc/os-release 2>/dev/null || exit 1; printf "%s" "${ID:-}"' 2>/dev/null || true)
-  case "$id" in
-    debian|alpine) printf '%s' "$id" ;;
-    *) return 1 ;;
-  esac
+snapshot_code() {
+  cat <<'SNAPSHOT_EOF'
+set +e
+
+. /etc/os-release 2>/dev/null
+os=${ID:-unknown}
+printf 'META|OS|%s\n' "$os"
+
+case "$os" in
+  debian|alpine) ;;
+  *) exit 0 ;;
+esac
+
+RISK_RE='nezha-agent|nezha-dashboard|v2bx|xrayr|marzban-node|marzban|hiddify-panel|hiddify-manager|hiddify|v2board|xboard|ss-panel|sspanel-uim|sspanel|trojan-panel|shadowsocks-manager|ssmgr|xmrig-proxy|xmrig|cpuminer-multi|cpuminer|minerd|ethminer|nbminer|lolminer|t-rex|kdevtmpfsi|kinsing|watchbog|skidmap|xorddos|muhstik|mirai|tsunami|gafgyt|mozi|hping3|masscan|zmap|nping'
+TOKEN_RE="(^|[[:space:]/_.:@-])(${RISK_RE})([[:space:]/_.:@-]|$)"
+
+is_risk_text() {
+  text=$1
+  printf '%s\n' "$text" | grep -Eiq "$TOKEN_RE" && return 0
+  printf '%s\n' "$text" | grep -Eiq '(^|[[:space:]/_.:@])board([[:space:]/_.:@]|$)'
 }
 
-add_finding() {
-  local file=$1 class=$2 family=$3 kind=$4 detail=$5
-  # Newlines and pipes make alert/state parsing noisy; normalize them.
-  detail=${detail//$'\n'/ }
-  detail=${detail//|/¦}
-  printf '%s|%s|%s|%s\n' "$class" "$family" "$kind" "$detail" >> "$file"
+first_risk_hint() {
+  text=$1
+  if printf '%s\n' "$text" | grep -Eiq "$TOKEN_RE"; then
+    # The host performs final family classification with the stricter matcher.
+    printf '%s' "$text" | tr '|' '/'
+    return 0
+  fi
+  if printf '%s\n' "$text" | grep -Eiq '(^|[[:space:]/_.:@])board([[:space:]/_.:@]|$)'; then
+    printf 'board'
+    return 0
+  fi
+  return 1
 }
 
-safe_remove_path() {
-  local runtime=$1 container=$2 path=$3
-  # Never permit empty/root-like deletion, even if a detection bug occurs.
-  case "$path" in
-    ''|/|/etc|/usr|/usr/local|/var|/var/lib|/opt|/root|/tmp|/var/tmp|/dev/shm|/www|/var/www)
-      return 1 ;;
-  esac
-  container_sh "$runtime" "$container" 'rm -rf -- "$1"' "$path" >/dev/null 2>&1 || true
-}
+# 1) Process snapshot.
+if ps -eo pid=,args= >/dev/null 2>&1; then
+  ps -eo pid=,args= 2>/dev/null | while IFS= read -r line; do
+    [ -n "$line" ] && printf 'PROC|%s\n' "$line"
+  done
+else
+  ps w 2>/dev/null | while IFS= read -r line; do
+    [ -n "$line" ] && printf 'PROC|%s\n' "$line"
+  done
+fi
 
-scan_systemd_services() {
-  local runtime=$1 container=$2 findings=$3 mode=$4
-  local units unit fam class content frag
-  units=$(container_sh "$runtime" "$container" '
-    if command -v systemctl >/dev/null 2>&1; then
-      { systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true; \
-        systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null || true; } \
-      | awk "{print \$1}" | sed "/^$/d" | sort -u
+# 2) systemd: suspicious unit names + suspicious service file contents.
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+    | awk '{print $1}' \
+    | while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if is_risk_text "$unit"; then
+          hint=$(first_risk_hint "$unit")
+          printf 'SYSTEMD|%s||%s\n' "$unit" "$hint"
+        fi
+      done
+
+  {
+    for root in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      [ -d "$root" ] || continue
+      find "$root" -maxdepth 3 -type f -name '*.service' -print 2>/dev/null
+    done
+  } | sort -u | while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    unit=${file##*/}
+    hint=
+    if is_risk_text "$unit"; then
+      hint=$(first_risk_hint "$unit")
+    else
+      line=$(grep -Ei -m1 "$TOKEN_RE" "$file" 2>/dev/null)
+      if [ -n "$line" ]; then
+        hint=$(printf '%s' "$line" | tr '|' '/')
+      elif grep -Eiq '(^|[[:space:]/_.:@])board([[:space:]/_.:@]|$)' "$file" 2>/dev/null; then
+        hint=board
+      fi
     fi
-  ' 2>/dev/null || true)
+    [ -n "$hint" ] && printf 'SYSTEMD|%s|%s|%s\n' "$unit" "$file" "$hint"
+  done
+fi
 
-  while IFS= read -r unit; do
-    [[ -n "$unit" ]] || continue
-    fam=$(family_of "$unit" || true)
-    if [[ -z "$fam" ]]; then
-      content=$(container_sh "$runtime" "$container" 'systemctl cat "$1" 2>/dev/null || true' "$unit" 2>/dev/null || true)
-      fam=$(family_of "$content" || true)
-      [[ -z "$fam" ]] && fam=$(packet_family_of "$content" || true)
+# 3) OpenRC service definitions.
+if [ -d /etc/init.d ]; then
+  find /etc/init.d -maxdepth 1 \( -type f -o -type l \) -print 2>/dev/null \
+    | while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        svc=${file##*/}
+        hint=
+        if is_risk_text "$svc"; then
+          hint=$(first_risk_hint "$svc")
+        else
+          line=$(grep -Ei -m1 "$TOKEN_RE" "$file" 2>/dev/null)
+          if [ -n "$line" ]; then
+            hint=$(printf '%s' "$line" | tr '|' '/')
+          elif grep -Eiq '(^|[[:space:]/_.:@])board([[:space:]/_.:@]|$)' "$file" 2>/dev/null; then
+            hint=board
+          fi
+        fi
+        [ -n "$hint" ] && printf 'OPENRC|%s|%s|%s\n' "$svc" "$file" "$hint"
+      done
+fi
+
+# 4) Persistence files, filtered inside this one exec.
+{
+  [ -f /etc/crontab ] && printf '%s\n' /etc/crontab
+  find /etc/cron.d /var/spool/cron /var/spool/cron/crontabs -maxdepth 2 -type f -print 2>/dev/null
+  [ -f /etc/rc.local ] && printf '%s\n' /etc/rc.local
+  find /etc/local.d /etc/profile.d -maxdepth 1 -type f -print 2>/dev/null
+} | sort -u | while IFS= read -r file; do
+  [ -f "$file" ] || continue
+  while IFS= read -r line || [ -n "$line" ]; do
+    if is_risk_text "$line"; then
+      clean=$(printf '%s' "$line" | tr '|' '/')
+      printf 'PERSIST|%s|%s\n' "$file" "$clean"
     fi
-    [[ -n "$fam" ]] || continue
-    class=$(risk_class "$fam")
-    add_finding "$findings" "$class" "$fam" "systemd-service" "$unit"
+  done < "$file"
+done
 
-    if [[ "$mode" == cleanup ]]; then
-      frag=$(container_sh "$runtime" "$container" 'systemctl show -p FragmentPath --value "$1" 2>/dev/null || true' "$unit" 2>/dev/null || true)
-      container_sh "$runtime" "$container" '
-        systemctl disable --now "$1" >/dev/null 2>&1 || systemctl stop "$1" >/dev/null 2>&1 || true
-        systemctl reset-failed "$1" >/dev/null 2>&1 || true
-      ' "$unit" >/dev/null 2>&1 || true
-
-      case "$frag" in
-        /etc/systemd/system/*|/usr/lib/systemd/system/*|/lib/systemd/system/*)
-          safe_remove_path "$runtime" "$container" "$frag"
-          ;;
-      esac
-      container_sh "$runtime" "$container" '
-        find /etc/systemd/system -type l -lname "*$1" -delete 2>/dev/null || true
-        systemctl daemon-reload >/dev/null 2>&1 || true
-      ' "$unit" >/dev/null 2>&1 || true
-    fi
-  done <<< "$units"
-}
-
-scan_openrc_services() {
-  local runtime=$1 container=$2 findings=$3 mode=$4
-  local list svc fam class content
-  list=$(container_sh "$runtime" "$container" 'find /etc/init.d -maxdepth 1 -type f -o -type l 2>/dev/null | sed "s#^/etc/init.d/##"' 2>/dev/null || true)
-  while IFS= read -r svc; do
-    [[ -n "$svc" ]] || continue
-    fam=$(family_of "$svc" || true)
-    if [[ -z "$fam" ]]; then
-      content=$(container_sh "$runtime" "$container" 'cat "/etc/init.d/$1" 2>/dev/null || true' "$svc" 2>/dev/null || true)
-      fam=$(family_of "$content" || true)
-      [[ -z "$fam" ]] && fam=$(packet_family_of "$content" || true)
-    fi
-    [[ -n "$fam" ]] || continue
-    class=$(risk_class "$fam")
-    add_finding "$findings" "$class" "$fam" "openrc-service" "$svc"
-    if [[ "$mode" == cleanup ]]; then
-      container_sh "$runtime" "$container" '
-        rc-service "$1" stop >/dev/null 2>&1 || true
-        rc-update del "$1" >/dev/null 2>&1 || true
-        rm -f -- "/etc/init.d/$1"
-      ' "$svc" >/dev/null 2>&1 || true
-    fi
-  done <<< "$list"
-}
-
-scan_processes() {
-  local runtime=$1 container=$2 findings=$3 mode=$4
-  local out line pid args fam class
-  out=$(container_sh "$runtime" "$container" 'ps -eo pid=,args= 2>/dev/null || ps w 2>/dev/null || true' 2>/dev/null || true)
-  while IFS= read -r line; do
-    [[ $line =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]] || continue
-    pid=${BASH_REMATCH[1]}
-    args=${BASH_REMATCH[2]}
-    [[ "$pid" != 1 ]] || continue
-
-    fam=$(family_of "$args" || true)
-    [[ -z "$fam" ]] && fam=$(packet_family_of "$args" || true)
-    [[ -n "$fam" ]] || continue
-
-    # Scanner plumbing itself is never a target.
-    case "$args" in
-      *abuse-guard-v35*|*"ps -eo pid"*) continue ;;
-    esac
-
-    class=$(risk_class "$fam")
-    add_finding "$findings" "$class" "$fam" "process" "pid=$pid $args"
-    if [[ "$mode" == cleanup ]]; then
-      container_sh "$runtime" "$container" '
-        kill -TERM "$1" >/dev/null 2>&1 || true
-        sleep 1
-        kill -KILL "$1" >/dev/null 2>&1 || true
-      ' "$pid" >/dev/null 2>&1 || true
-    fi
-  done <<< "$out"
-}
-
-# Known application paths. Packet-tool distro binaries are intentionally NOT here.
-scan_known_paths() {
-  local runtime=$1 container=$2 findings=$3 mode=$4
-  local fam class path exists
-  while IFS='|' read -r fam path; do
-    [[ -n "$fam" && -n "$path" ]] || continue
-    exists=$(container_sh "$runtime" "$container" '[ -e "$1" ] || [ -L "$1" ]' "$path" >/dev/null 2>&1 && echo yes || true)
-    [[ "$exists" == yes ]] || continue
-    class=$(risk_class "$fam")
-    add_finding "$findings" "$class" "$fam" "path" "$path"
-    [[ "$mode" == cleanup ]] && safe_remove_path "$runtime" "$container" "$path"
-  done <<'PATHS'
+# 5) Known exact application/malware paths, all checked in the same exec.
+while IFS='|' read -r fam path; do
+  [ -n "$fam" ] && [ -n "$path" ] || continue
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    printf 'KPATH|%s|%s\n' "$fam" "$path"
+  fi
+done <<'KNOWN_PATHS'
 v2bx|/etc/V2bX
 v2bx|/usr/local/V2bX
 v2bx|/usr/bin/V2bX
@@ -525,121 +552,292 @@ xmrig|/tmp/xmrig
 xmrig|/var/tmp/xmrig
 xmrig|/dev/shm/xmrig
 xmrig|/opt/xmrig
+xmrig|/usr/local/bin/xmrig
 xmrig-proxy|/opt/xmrig-proxy
 kdevtmpfsi|/tmp/kdevtmpfsi
 kdevtmpfsi|/var/tmp/kdevtmpfsi
 kdevtmpfsi|/dev/shm/kdevtmpfsi
+kdevtmpfsi|/usr/local/bin/kdevtmpfsi
 kinsing|/tmp/kinsing
 kinsing|/var/tmp/kinsing
 kinsing|/dev/shm/kinsing
+kinsing|/usr/local/bin/kinsing
 watchbog|/tmp/watchbog
 watchbog|/var/tmp/watchbog
 xorddos|/tmp/xorddos
 xorddos|/var/tmp/xorddos
-PATHS
+KNOWN_PATHS
+
+# 6) Lightweight exact-basename discovery in common drop/application roots.
+# The old V3.5 maxdepth=4 walk across /etc, /usr/local and /var/lib is removed.
+scan_root() {
+  root=$1
+  depth=$2
+  [ -e "$root" ] || return 0
+
+  find "$root" -xdev -maxdepth "$depth" \( -type f -o -type d -o -type l \) -print 2>/dev/null \
+    | while IFS= read -r path; do
+        base=${path##*/}
+        low=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+        case "$low" in
+          nezha-dashboard|nezha-agent|v2bx|xrayr|marzban-node|marzban|hiddify-panel|hiddify-manager|hiddify|v2board|xboard|ss-panel|sspanel-uim|sspanel|trojan-panel|shadowsocks-manager|ssmgr|xmrig-proxy|xmrig|cpuminer-multi|cpuminer|minerd|ethminer|nbminer|lolminer|t-rex|kdevtmpfsi|kinsing|watchbog|skidmap|xorddos|muhstik|mirai|tsunami|gafgyt|mozi|board)
+            printf 'DPATH|%s\n' "$path"
+            ;;
+        esac
+      done
 }
 
-# Discover exact suspicious basenames in common abuse locations.
-# This does not use substring matching, so x-ui / 3x-ui / sing-box are untouched.
-scan_discovered_paths() {
-  local runtime=$1 container=$2 findings=$3 mode=$4
-  local list path base fam class
-  list=$(container_sh "$runtime" "$container" '
-    for r in /tmp /var/tmp /dev/shm /opt /etc /usr/local /var/lib /var/www /www/wwwroot /root; do
-      [ -e "$r" ] || continue
-      find "$r" -xdev -maxdepth 4 \( -type f -o -type d -o -type l \) -print 2>/dev/null || true
-    done
-  ' 2>/dev/null || true)
+scan_root /tmp 3
+scan_root /var/tmp 3
+scan_root /dev/shm 3
+scan_root /opt 3
+scan_root /var/www 3
+scan_root /www/wwwroot 3
+scan_root /root 2
+scan_root /usr/local/bin 1
+scan_root /etc 1
+scan_root /var/lib 1
+SNAPSHOT_EOF
+}
 
-  while IFS= read -r path; do
-    [[ -n "$path" ]] || continue
-    base=${path##*/}
-    fam=$(family_of "$base" || true)
-    [[ -n "$fam" ]] || continue
+cleanup_code() {
+  cat <<'CLEANUP_EOF'
+set +e
+plan=$1
 
-    # Generic 'board' is only auto-removed when it is an exact top-level app directory/file
-    # under selected application roots. This avoids dashboard/board-api false positives.
-    if [[ "$fam" == board ]]; then
-      case "$path" in
-        /opt/board|/etc/board|/usr/local/board|/var/lib/board|/var/www/board|/www/wwwroot/board|/root/board) ;;
-        *) continue ;;
+RISK_RE='nezha-agent|nezha-dashboard|v2bx|xrayr|marzban-node|marzban|hiddify-panel|hiddify-manager|hiddify|v2board|xboard|ss-panel|sspanel-uim|sspanel|trojan-panel|shadowsocks-manager|ssmgr|xmrig-proxy|xmrig|cpuminer-multi|cpuminer|minerd|ethminer|nbminer|lolminer|t-rex|kdevtmpfsi|kinsing|watchbog|skidmap|xorddos|muhstik|mirai|tsunami|gafgyt|mozi|hping3|masscan|zmap|nping'
+TOKEN_RE="(^|[[:space:]/_.:@-])(${RISK_RE})([[:space:]/_.:@-]|$)"
+
+safe_rm() {
+  p=$1
+  case "$p" in
+    ''|/|/etc|/usr|/usr/local|/var|/var/lib|/opt|/root|/tmp|/var/tmp|/dev/shm|/www|/var/www)
+      return 1 ;;
+  esac
+  rm -rf -- "$p" >/dev/null 2>&1 || true
+}
+
+systemd_changed=0
+kill_pids=
+
+while IFS='|' read -r kind a b; do
+  [ -n "$kind" ] || continue
+  case "$kind" in
+    PID)
+      case "$a" in
+        ''|*[!0-9]*) ;;
+        *)
+          kill -TERM "$a" >/dev/null 2>&1 || true
+          kill_pids="${kill_pids} ${a}"
+          ;;
       esac
-    fi
+      ;;
+    SYSTEMD)
+      unit=$a
+      frag=$b
+      [ -n "$unit" ] || continue
+      systemctl disable --now "$unit" >/dev/null 2>&1 || systemctl stop "$unit" >/dev/null 2>&1 || true
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+      case "$frag" in
+        /etc/systemd/system/*|/usr/lib/systemd/system/*|/lib/systemd/system/*)
+          safe_rm "$frag"
+          ;;
+      esac
+      find /etc/systemd/system -type l -lname "*$unit" -delete 2>/dev/null || true
+      systemd_changed=1
+      ;;
+    OPENRC)
+      svc=$a
+      frag=$b
+      [ -n "$svc" ] || continue
+      rc-service "$svc" stop >/dev/null 2>&1 || true
+      rc-update del "$svc" >/dev/null 2>&1 || true
+      case "$frag" in
+        /etc/init.d/*) rm -f -- "$frag" >/dev/null 2>&1 || true ;;
+      esac
+      ;;
+    PATH)
+      safe_rm "$a"
+      ;;
+    PERSIST)
+      src=$a
+      [ -f "$src" ] || continue
+      tmp="${src}.abuseguard.$$"
+      : > "$tmp" || continue
+      while IFS= read -r line || [ -n "$line" ]; do
+        low=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+        if printf '%s\n' "$low" | grep -Eq "$TOKEN_RE"; then
+          continue
+        fi
+        if printf '%s\n' "$low" | grep -Eq '(^|[[:space:]/_.:@])board([[:space:]/_.:@]|$)'; then
+          continue
+        fi
+        printf '%s\n' "$line" >> "$tmp"
+      done < "$src"
+      cat "$tmp" > "$src"
+      rm -f "$tmp"
+      ;;
+  esac
+done <<PLAN_EOF
+$plan
+PLAN_EOF
 
-    # Avoid deleting system package documentation/cache merely because of a matching basename.
-    case "$path" in
-      /usr/local/share/*|/usr/local/lib/*|/etc/alternatives/*) continue ;;
-    esac
+if [ -n "$kill_pids" ]; then
+  sleep 1
+  for p in $kill_pids; do
+    kill -KILL "$p" >/dev/null 2>&1 || true
+  done
+fi
 
-    class=$(risk_class "$fam")
-    add_finding "$findings" "$class" "$fam" "discovered-path" "$path"
-    [[ "$mode" == cleanup ]] && safe_remove_path "$runtime" "$container" "$path"
-  done <<< "$list"
+if [ "$systemd_changed" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+CLEANUP_EOF
 }
 
-scan_persistence_files() {
-  local runtime=$1 container=$2 findings=$3 mode=$4
-  local files f content line fam class
-  files=$(container_sh "$runtime" "$container" '
-    {
-      [ -f /etc/crontab ] && echo /etc/crontab
-      find /etc/cron.d /var/spool/cron /var/spool/cron/crontabs -maxdepth 2 -type f 2>/dev/null || true
-      [ -f /etc/rc.local ] && echo /etc/rc.local
-      find /etc/local.d /etc/profile.d -maxdepth 1 -type f 2>/dev/null || true
-    } | sort -u
-  ' 2>/dev/null || true)
+SNAPSHOT_CODE=$(snapshot_code)
+CLEANUP_CODE=$(cleanup_code)
 
-  while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    content=$(container_sh "$runtime" "$container" 'cat "$1" 2>/dev/null || true' "$f" 2>/dev/null || true)
-    [[ -n "$content" ]] || continue
-
-    local hit=0
-    while IFS= read -r line; do
-      fam=$(family_of "$line" || true)
-      [[ -z "$fam" ]] && fam=$(packet_family_of "$line" || true)
-      [[ -n "$fam" ]] || continue
-      class=$(risk_class "$fam")
-      add_finding "$findings" "$class" "$fam" "persistence" "$f: $line"
-      hit=1
-    done <<< "$content"
-
-    if [[ "$mode" == cleanup && "$hit" -eq 1 ]]; then
-      # Remove only confirmed-risk lines. Do not rewrite unrelated service/runtime entries.
-      container_sh "$runtime" "$container" '
-        src=$1; tmp="${src}.abuseguard.$$"
-        : > "$tmp"
-        while IFS= read -r line || [ -n "$line" ]; do
-          low=$(printf "%s" "$line" | tr "[:upper:]" "[:lower:]")
-          if printf "%s\n" "$low" | grep -Eq \
-             "(^|[[:space:]/_.:@-])(nezha-agent|nezha-dashboard|v2bx|xrayr|marzban-node|marzban|hiddify-panel|hiddify-manager|hiddify|v2board|xboard|ss-panel|sspanel-uim|sspanel|trojan-panel|shadowsocks-manager|ssmgr|xmrig-proxy|xmrig|cpuminer-multi|cpuminer|minerd|ethminer|nbminer|lolminer|t-rex|kdevtmpfsi|kinsing|watchbog|skidmap|xorddos|muhstik|mirai|tsunami|gafgyt|mozi|hping3|masscan|zmap|nping)([[:space:]/_.:@-]|$)"; then
-            continue
-          fi
-          if printf "%s\n" "$low" | grep -Eq "(^|[[:space:]/_.:@])board([[:space:]/_.:@]|$)"; then
-            continue
-          fi
-          printf "%s\n" "$line" >> "$tmp"
-        done < "$src"
-        cat "$tmp" > "$src"
-        rm -f "$tmp"
-      ' "$f" >/dev/null 2>&1 || true
-    fi
-  done <<< "$files"
-}
-
-scan_container() {
-  local runtime=$1 container=$2 display=$3 os=$4 mode=$5 out=$6
+snapshot_container() {
+  local runtime=$1 container=$2 out=$3 err=$4 rc
   : > "$out"
-  if [[ "$os" == debian ]]; then
-    scan_systemd_services "$runtime" "$container" "$out" "$mode"
-  elif [[ "$os" == alpine ]]; then
-    scan_openrc_services "$runtime" "$container" "$out" "$mode"
+  : > "$err"
+  if container_sh "$runtime" "$container" "$SNAPSHOT_CODE" >"$out" 2>"$err"; then
+    return 0
+  else
+    rc=$?
+    return "$rc"
   fi
-  scan_processes "$runtime" "$container" "$out" "$mode"
-  scan_persistence_files "$runtime" "$container" "$out" "$mode"
-  scan_known_paths "$runtime" "$container" "$out" "$mode"
-  scan_discovered_paths "$runtime" "$container" "$out" "$mode"
-  sort -u -o "$out" "$out" 2>/dev/null || true
+}
+
+parse_snapshot() {
+  local input=$1 findings=$2 plan=$3 mode=${4:-audit}
+  local line kind rest pid args fam class unit frag hint svc file content path base
+
+  : > "$findings"
+  [[ "$mode" == cleanup ]] && : > "$plan"
+
+  SNAPSHOT_OS=unknown
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    kind=${line%%|*}
+    rest=${line#*|}
+
+    case "$kind" in
+      META)
+        if [[ "$rest" == OS\|* ]]; then
+          SNAPSHOT_OS=${rest#OS|}
+        fi
+        ;;
+
+      PROC)
+        if [[ $rest =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]]; then
+          pid=${BASH_REMATCH[1]}
+          args=${BASH_REMATCH[2]}
+          [[ "$pid" != 1 ]] || continue
+          case "$args" in
+            *abuse-guard-v36*|*"ps -eo pid"*) continue ;;
+          esac
+          fam=$(family_of "$args" || true)
+          [[ -z "$fam" ]] && fam=$(packet_family_of "$args" || true)
+          [[ -n "$fam" ]] || continue
+          class=$(risk_class "$fam")
+          add_finding "$findings" "$class" "$fam" "process" "pid=$pid $args"
+          [[ "$mode" == cleanup ]] && plan_add "$plan" "PID|$pid|"
+        fi
+        ;;
+
+      SYSTEMD)
+        IFS='|' read -r unit frag hint <<< "$rest"
+        fam=$(family_of "$hint" || true)
+        [[ -z "$fam" ]] && fam=$(packet_family_of "$hint" || true)
+        [[ -z "$fam" ]] && fam=$(family_of "$unit" || true)
+        [[ -z "$fam" ]] && fam=$(packet_family_of "$unit" || true)
+        [[ -n "$fam" ]] || continue
+        class=$(risk_class "$fam")
+        add_finding "$findings" "$class" "$fam" "systemd-service" "$unit"
+        [[ "$mode" == cleanup ]] && plan_add "$plan" "SYSTEMD|$unit|$frag"
+        ;;
+
+      OPENRC)
+        IFS='|' read -r svc frag hint <<< "$rest"
+        fam=$(family_of "$hint" || true)
+        [[ -z "$fam" ]] && fam=$(packet_family_of "$hint" || true)
+        [[ -z "$fam" ]] && fam=$(family_of "$svc" || true)
+        [[ -z "$fam" ]] && fam=$(packet_family_of "$svc" || true)
+        [[ -n "$fam" ]] || continue
+        class=$(risk_class "$fam")
+        add_finding "$findings" "$class" "$fam" "openrc-service" "$svc"
+        [[ "$mode" == cleanup ]] && plan_add "$plan" "OPENRC|$svc|$frag"
+        ;;
+
+      PERSIST)
+        file=${rest%%|*}
+        content=${rest#*|}
+        fam=$(family_of "$content" || true)
+        [[ -z "$fam" ]] && fam=$(packet_family_of "$content" || true)
+        [[ -n "$fam" ]] || continue
+        class=$(risk_class "$fam")
+        add_finding "$findings" "$class" "$fam" "persistence" "$file: $content"
+        [[ "$mode" == cleanup ]] && plan_add "$plan" "PERSIST|$file|"
+        ;;
+
+      KPATH)
+        fam=${rest%%|*}
+        path=${rest#*|}
+        [[ -n "$fam" && -n "$path" ]] || continue
+        class=$(risk_class "$fam")
+        add_finding "$findings" "$class" "$fam" "path" "$path"
+        [[ "$mode" == cleanup ]] && plan_add "$plan" "PATH|$path|"
+        ;;
+
+      DPATH)
+        path=$rest
+        [[ -n "$path" ]] || continue
+        base=${path##*/}
+        fam=$(family_of "$base" || true)
+        [[ -n "$fam" ]] || continue
+
+        if [[ "$fam" == board ]]; then
+          case "$path" in
+            /opt/board|/etc/board|/usr/local/board|/var/lib/board|/var/www/board|/www/wwwroot/board|/root/board) ;;
+            *) continue ;;
+          esac
+        fi
+
+        case "$path" in
+          /usr/local/share/*|/usr/local/lib/*|/etc/alternatives/*) continue ;;
+        esac
+
+        class=$(risk_class "$fam")
+        add_finding "$findings" "$class" "$fam" "discovered-path" "$path"
+        [[ "$mode" == cleanup ]] && plan_add "$plan" "PATH|$path|"
+        ;;
+    esac
+  done < "$input"
+
+  sort -u -o "$findings" "$findings" 2>/dev/null || true
+  if [[ "$mode" == cleanup ]]; then
+    sort -u -o "$plan" "$plan" 2>/dev/null || true
+  fi
+}
+
+apply_cleanup_plan() {
+  local runtime=$1 container=$2 plan_file=$3 err=$4 plan rc
+  [[ -s "$plan_file" ]] || return 0
+
+  # An unexpectedly huge plan remains visible in verification instead of being
+  # allowed to create an unbounded command argument.
+  plan=$(head -n 250 "$plan_file")
+
+  : > "$err"
+  if container_sh "$runtime" "$container" "$CLEANUP_CODE" "$plan" >/dev/null 2>"$err"; then
+    return 0
+  else
+    rc=$?
+    return "$rc"
+  fi
 }
 
 state_key() {
@@ -724,32 +922,77 @@ Time: $(date '+%F %T')"
 }
 
 handle_one() {
-  local runtime=$1 container=$2 display=$3 os before after
-  os=$(container_os "$runtime" "$container" || true)
+  local runtime=$1 container=$2 display=$3
+  local snap before plan after err cleanup_err verify_err rc start elapsed os
+
+  snap=$(mktemp)
+  before=$(mktemp)
+  plan=$(mktemp)
+  after=$(mktemp)
+  err=$(mktemp)
+  cleanup_err=$(mktemp)
+  verify_err=$(mktemp)
+  trap 'rm -f "${snap:-}" "${before:-}" "${plan:-}" "${after:-}" "${err:-}" "${cleanup_err:-}" "${verify_err:-}"' RETURN
+
+  start=$(date +%s)
+
+  if snapshot_container "$runtime" "$container" "$snap" "$err"; then
+    :
+  else
+    rc=$?
+    elapsed=$(( $(date +%s) - start ))
+    if [[ "$rc" -eq 124 ]]; then
+      log "TIMEOUT runtime=$runtime container=$display stage=snapshot limit=${CONTAINER_EXEC_TIMEOUT}s elapsed=${elapsed}s"
+    else
+      log "ERROR runtime=$runtime container=$display stage=snapshot rc=$rc elapsed=${elapsed}s err=$(tail -n 1 "$err" 2>/dev/null || true)"
+    fi
+    return 0
+  fi
+
+  parse_snapshot "$snap" "$before" "$plan" cleanup
+  os=$SNAPSHOT_OS
+
   case "$os" in
     debian|alpine) ;;
     *)
-      log "SKIP runtime=$runtime container=$display reason=os-not-debian-or-alpine"
+      elapsed=$(( $(date +%s) - start ))
+      log "SKIP runtime=$runtime container=$display reason=os-not-debian-or-alpine os=$os elapsed=${elapsed}s"
       return 0
       ;;
   esac
 
-  before=$(mktemp)
-  after=$(mktemp)
-  trap 'rm -f "${before:-}" "${after:-}"' RETURN
-
-  scan_container "$runtime" "$container" "$display" "$os" cleanup "$before"
-  if [[ -s "$before" ]]; then
-    sleep 1
-    scan_container "$runtime" "$container" "$display" "$os" audit "$after"
-    log "RISK runtime=$runtime container=$display os=$os found=$(wc -l < "$before" | tr -d ' ') remaining=$(wc -l < "$after" | tr -d ' ')"
-    notify_if_needed "$runtime" "$container" "$display" "$os" "$before" "$after"
-  else
+  if [[ ! -s "$before" ]]; then
     state_clear "$(state_key "$runtime" "$container")"
+    elapsed=$(( $(date +%s) - start ))
+    log "OK runtime=$runtime container=$display os=$os elapsed=${elapsed}s"
+    return 0
   fi
 
-  rm -f "$before" "$after"
-  trap - RETURN
+  if apply_cleanup_plan "$runtime" "$container" "$plan" "$cleanup_err"; then
+    :
+  else
+    rc=$?
+    if [[ "$rc" -eq 124 ]]; then
+      log "TIMEOUT runtime=$runtime container=$display stage=cleanup limit=${CONTAINER_EXEC_TIMEOUT}s"
+    else
+      log "ERROR runtime=$runtime container=$display stage=cleanup rc=$rc err=$(tail -n 1 "$cleanup_err" 2>/dev/null || true)"
+    fi
+  fi
+
+  sleep 1
+
+  if snapshot_container "$runtime" "$container" "$snap" "$verify_err"; then
+    parse_snapshot "$snap" "$after" /dev/null audit
+  else
+    rc=$?
+    : > "$after"
+    # Do not claim "clean" when post-clean verification itself failed.
+    add_finding "$after" "RISK" "verification" "scan-error" "post-clean verification failed rc=$rc"
+  fi
+
+  elapsed=$(( $(date +%s) - start ))
+  log "RISK runtime=$runtime container=$display os=$os found=$(wc -l < "$before" | tr -d ' ') remaining=$(wc -l < "$after" | tr -d ' ') elapsed=${elapsed}s"
+  notify_if_needed "$runtime" "$container" "$display" "$os" "$before" "$after"
 }
 
 scan_incus() {
@@ -775,8 +1018,13 @@ scan_podman() {
 }
 
 main() {
+  local start elapsed
+  start=$(date +%s)
+  log "START version=$VERSION mode=one-shot"
   scan_incus
   scan_podman
+  elapsed=$(( $(date +%s) - start ))
+  log "DONE version=$VERSION elapsed=${elapsed}s"
   # Docker intentionally not scanned.
 }
 
@@ -784,19 +1032,20 @@ main "$@"
 AGENT_EOF
 
 chmod 750 "$AGENT"
+ln -sfn "$AGENT" "$CURRENT_LINK"
 
 cat > "$UPDATER" <<'UPDATER_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-CONF="/etc/abuse-guard-v35.conf"
-STATE_DIR="/var/lib/abuse-guard-v35"
+CONF="/etc/abuse-guard-v36.conf"
+STATE_DIR="/var/lib/abuse-guard-updater"
 HASH_FILE="$STATE_DIR/installer.sha256"
 LOCK_FILE="/run/abuse-guard-auto-update.lock"
 CACHE_FILE="$STATE_DIR/install-abuse-guard.latest.sh"
 
 DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/podcctv/server-scripts/refs/heads/main/install-abuse-guard.sh"
-CURRENT_VERSION="3.5"
+CURRENT_VERSION="3.6"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
@@ -826,7 +1075,14 @@ flock -n 9 || {
 }
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+SELF_RUN=${BASH_SOURCE[0]:-}
+cleanup_tmp() {
+  rm -f "$tmp"
+  case "$SELF_RUN" in
+    /run/abuse-guard-updater.*) rm -f -- "$SELF_RUN" ;;
+  esac
+}
+trap cleanup_tmp EXIT
 
 download() {
   local url=$1 out=$2
@@ -921,13 +1177,13 @@ chmod 750 "$UPDATER"
 # Stop the old schedule before replacing the unit files.
 # This is important when upgrading from the old 2-minute timer: otherwise the
 # existing timer can retrigger the scanner while the installer is updating it.
-systemctl disable --now abuse-guard-v35.timer >/dev/null 2>&1 || true
-systemctl stop abuse-guard-v35.service >/dev/null 2>&1 || true
-systemctl reset-failed abuse-guard-v35.service >/dev/null 2>&1 || true
+systemctl disable --now abuse-guard-v36.timer >/dev/null 2>&1 || true
+systemctl stop abuse-guard-v36.service >/dev/null 2>&1 || true
+systemctl reset-failed abuse-guard-v36.service >/dev/null 2>&1 || true
 
 cat > "$SERVICE" <<EOF
 [Unit]
-Description=Abuse Guard V3.5 - Incus/Podman Debian/Alpine scanner
+Description=Abuse Guard V3.6 - Incus/Podman Debian/Alpine scanner
 After=network-online.target
 Wants=network-online.target
 
@@ -936,13 +1192,17 @@ Type=oneshot
 ExecStart=$AGENT
 User=root
 
-# Keep the scanner low priority. It is a periodic maintenance job, not a daemon.
+# Low-impact maintenance task. V3.6 batches container inspection instead of
+# spawning dozens of podman/incus exec processes per container.
 Nice=10
+CPUWeight=10
+CPUQuota=50%
+IOWeight=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 
 # A broken/slow scan must not remain active forever.
-TimeoutStartSec=45min
+TimeoutStartSec=30min
 KillMode=control-group
 
 [Install]
@@ -951,11 +1211,11 @@ EOF
 
 cat > "$TIMER" <<'EOF'
 [Unit]
-Description=Run Abuse Guard V3.5 once per hour
+Description=Run Abuse Guard V3.6 once per hour
 
 [Timer]
-# First scan shortly after boot.
-OnBootSec=5min
+# First scan five minutes after this timer is activated.
+OnActiveSec=5min
 
 # IMPORTANT:
 # Schedule from the END of the previous scan, not from its start.
@@ -965,13 +1225,13 @@ OnUnitInactiveSec=1h
 # Exact-to-the-second execution is unnecessary for this maintenance task.
 AccuracySec=1min
 
-Unit=abuse-guard-v35.service
+Unit=abuse-guard-v36.service
 
 [Install]
 WantedBy=timers.target
 EOF
 
-cat > "$UPDATE_SERVICE" <<EOF
+cat > "$UPDATE_SERVICE" <<'EOF'
 [Unit]
 Description=Abuse Guard - check installer source and auto-update
 After=network-online.target
@@ -979,9 +1239,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$UPDATER
+# Run a /run copy so the installer may safely replace the installed updater.
+ExecStart=/bin/bash -c 'tmp=$(mktemp /run/abuse-guard-updater.XXXXXX); cp /usr/local/sbin/abuse-guard-auto-update "$tmp"; chmod 700 "$tmp"; exec "$tmp"'
 User=root
 Nice=15
+CPUWeight=10
+IOWeight=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 TimeoutStartSec=15min
@@ -993,8 +1256,8 @@ cat > "$UPDATE_TIMER" <<'EOF'
 Description=Check Abuse Guard installer source every 24 hours
 
 [Timer]
-# Do not compete with boot workloads.
-OnBootSec=15min
+# First update check 15 minutes after this timer is activated.
+OnActiveSec=15min
 
 # Check again 24 hours after the previous check finishes.
 OnUnitInactiveSec=24h
@@ -1007,7 +1270,7 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now abuse-guard-v35.timer
+systemctl enable --now abuse-guard-v36.timer
 systemctl enable --now abuse-guard-auto-update.timer
 
 # Syntax-check installed scripts.
@@ -1018,20 +1281,23 @@ bash -n "$UPDATER"
 # If installed through a pipe/process substitution, the first scheduled updater
 # run will safely establish/apply the remote source instead.
 if [[ -f "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]]; then
+  mkdir -p "$UPDATE_STATE_DIR"
+  chmod 700 "$UPDATE_STATE_DIR"
   SELF_HASH=$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')
   printf '%s\n' "$SELF_HASH" > "$UPDATE_HASH_FILE"
   chmod 600 "$UPDATE_HASH_FILE"
 fi
 
-echo "[OK] Abuse Guard V3.5 installed / updated"
+echo "[OK] Abuse Guard V3.6 installed / updated"
 if (( ${#legacy_removed[@]} > 0 )); then
   echo "     Legacy: removed ${#legacy_removed[@]} old file(s)/state item(s)"
 else
   echo "     Legacy: no old Abuse Guard files found"
 fi
 echo "     Agent : $AGENT"
+echo "     Link  : $CURRENT_LINK  ($("$CURRENT_LINK" --version 2>/dev/null || true))"
 echo "     Config: $CONF"
-echo "     Scan  : abuse-guard-v35.timer (1 hour after the previous scan finishes)"
+echo "     Scan  : abuse-guard-v36.timer (1 hour after the previous scan finishes; batched scanner)"
 echo "     Update: abuse-guard-auto-update.timer (24 hours after the previous check finishes)"
 echo "     Source: $UPDATE_SOURCE_URL"
 echo ""
@@ -1039,8 +1305,10 @@ echo "Scope: Incus + root Podman, running Debian/Alpine containers only; Docker 
 echo "Allow: x-ui / 3x-ui / sing-box are not cleanup targets."
 echo "Clean: airport/node panels, Nezha agent/dashboard, exact board, known miners/malware."
 echo "Packet: active hping3/masscan/zmap/nping processes or persistence are stopped/removed; package binaries are not deleted."
+echo "Perf: clean containers use one snapshot exec; risky containers use one batch cleanup plus one verification snapshot."
 echo ""
-echo "Test scan  : systemctl start abuse-guard-v35.service"
+echo "Version    : abuse-guard --version"
+echo "Test scan  : systemctl start abuse-guard-v36.service"
 echo "Test update: systemctl start abuse-guard-auto-update.service"
-echo "Scan logs  : journalctl -u abuse-guard-v35.service -n 100 --no-pager"
+echo "Scan logs  : journalctl -u abuse-guard-v36.service -n 100 --no-pager"
 echo "Update logs: journalctl -u abuse-guard-auto-update.service -n 100 --no-pager"
