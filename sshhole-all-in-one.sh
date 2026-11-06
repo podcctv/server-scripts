@@ -3,7 +3,7 @@
 # Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
 # Safe baseline: do not change authentication, users, keys, passwords, ports,
 # SSH daemon config, host firewall, repositories, container lifecycle or images.
-# Updated: 2026-11-06 (v1.5). POSIX sh, BusyBox ash compatible.
+# Updated: 2026-11-06 (v1.6). POSIX sh, BusyBox ash compatible.
 set -u
 umask 077
 
@@ -50,7 +50,9 @@ SAFE means no OpenSSH server is detected (safe against this OpenSSH issue),
 OK means already-patched OpenSSH. FIXED(OK) means this run patched it and verified
 the relevant running service (or found no running sshd). SKIP means out of scope.
 UNVERIFIED means the image could not be audited reliably; never assume safe.
-No repository rewrites / full distribution upgrades / user or SSH config changes.
+No permanent repository rewrites / full distribution upgrades / user or SSH config changes.
+If the configured mirror is outdated, retries using a temporary, verified Alpine
+official repository file for the SAME release branch; removes the file on exit.
 Uses SIGHUP only on a PID-file-verified SSH listener; if uncertain, leaves a
 PENDING_RELOAD item (the disk is patched but live daemon may still be vulnerable).
 Container image templates are NOT updated: Docker/Podman re-create needs new image.
@@ -301,31 +303,72 @@ else
   out '[WARN] Pre-upgrade sshd configuration validation failed; will NOT auto-reload'
 fi
 
-# Do not upgrade the entire Alpine installation. Do not rewrite package repositories.
+# Do not upgrade the entire Alpine installation or permanently change repositories.
+# Use the configured mirror first. If that mirror is stale (APK returns success
+# but leaves a vulnerable revision), retry ONLY preinstalled OpenSSH components
+# from signed, official Alpine packages for this exact distribution branch.
+# --repositories-file replaces repository selection for this ONE apk invocation.
 if [ "$old" = yes ]; then
-  out '[ACTION] apk update + targeted upgrade of preinstalled OpenSSH components'
-  if ! apk update; then out '[ERROR] apk update failed; repositories unchanged'; finish FAIL 2; fi
   set -- "$pkg"
-  # Upgrade *installed* related OpenSSH subpackages, not the entire OS or new
-  # packages. This prevents server/common revisions from diverging on Alpine.
   for p in openssh openssh-server openssh-server-pam openssh-server-krb5 \
            openssh-server-common openssh-server-common-openrc \
            openssh-keygen openssh-sftp-server openssh-client-common; do
     if [ "$p" != "$pkg" ] && apk info -e "$p" >/dev/null 2>&1; then set -- "$@" "$p"; fi
   done
-  out "[ACTION] apk upgrade packages: $*"
-  # Upgrade existing dependency graph only; no installs or major-version migrations.
-  if ! apk upgrade "$@"; then
-    out '[ERROR] APK upgrade failed; examine package state and logs'; finish FAIL 2
+  out "[ACTION] Upgrade preinstalled OpenSSH components: $*"
+  out '[ACTION] First attempt: configured APK repositories (unchanged)'
+  if ! apk update; then
+    out '[WARN] Configured APK repository update failed; trying verified official fallback'
+  elif ! apk upgrade "$@"; then
+    out '[WARN] OpenSSH upgrade from configured repository failed; checking package state then trying official fallback'
   fi
+  new=$(version_of "$pkg")
+  [ -n "$new" ] || { out '[ERROR] Cannot read installed OpenSSH version after configured-mirror attempt'; finish FAIL 2; }
+  post_cmp=$(compare "$new" "$min")
+  case "$post_cmp" in
+    '>'|'=') out "[OK] Configured mirror supplied patched $pkg=$new" ;;
+    '<')
+      out "[WARN] Configured mirror did not provide the required patch: $pkg=$new (need >=$min)"
+      case "$branch" in
+        edge) official_branch=edge ;;
+        3.16|3.17|3.18|3.19|3.20|3.21|3.22|3.23|3.24)
+          official_branch="v$branch" ;;
+        *) out '[ERROR] No official fallback is defined for this Alpine branch'; finish FAIL 2 ;;
+      esac
+      fallback="$TMP/official-repositories"
+      # Use Alpine's own HTTPS CDN and APK signing keys, and only the same
+      # release branch. Never add edge or latest-stable to a stable installation.
+      printf 'https://dl-cdn.alpinelinux.org/alpine/%s/main\nhttps://dl-cdn.alpinelinux.org/alpine/%s/community\n' \
+        "$official_branch" "$official_branch" > "$fallback" || {
+          out '[ERROR] Cannot prepare temporary Alpine official repository list'; finish FAIL 2;
+        }
+      out "[ACTION] Temporary official Alpine repository fallback: $official_branch (configuration untouched)"
+      # --no-cache forces fresh package indexes: the stale mirror's cached
+      # APKINDEX must NOT influence this second attempt.
+      if ! apk --repositories-file "$fallback" --no-cache upgrade "$@"; then
+        out '[ERROR] Official Alpine fallback upgrade failed (network, package pinning or repository issue)'
+        finish FAIL 2
+      fi
+      new=$(version_of "$pkg")
+      [ -n "$new" ] || { out '[ERROR] Cannot read OpenSSH version after official fallback'; finish FAIL 2; }
+      post_cmp=$(compare "$new" "$min")
+      case "$post_cmp" in
+        '>'|'=') out "[OK] Official fallback patched $pkg=$new; /etc/apk/repositories left unchanged" ;;
+        '<') out "[ERROR] Official fallback did not reach patched version ($pkg=$new; need >=$min)"; finish FAIL 2 ;;
+        *) out "[ERROR] Unexpected apk version comparison after fallback: $post_cmp"; finish FAIL 2 ;;
+      esac
+      ;;
+    *) out "[ERROR] Unexpected apk version comparison after upgrade: $post_cmp"; finish FAIL 2 ;;
+  esac
+else
+  new=$(version_of "$pkg")
+  [ -n "$new" ] || { out '[ERROR] Cannot read installed OpenSSH version'; finish FAIL 2; }
+  post_cmp=$(compare "$new" "$min")
+  case "$post_cmp" in
+    '>'|'=') out "[OK] $pkg remains patched at $new" ;;
+    *) out "[ERROR] Patched version check failed: $pkg=$new"; finish FAIL 2 ;;
+  esac
 fi
-new=$(version_of "$pkg")
-[ -n "$new" ] || { out '[ERROR] Post-upgrade package version cannot be read'; finish FAIL 2; }
-post_cmp=$(compare "$new" "$min")
-case "$post_cmp" in
-  '>'|'=') out "[OK] $pkg now $new (patched on disk)" ;;
-  *) out "[ERROR] Repo has no verified fix ($pkg=$new, expected >=$min)"; finish FAIL 2 ;;
-esac
 if [ "$old" = yes ]; then
   out "[INFO] OpenSSH successfully upgraded from $ver to $new"
   out 'SSHH_PACKAGE_UPDATED=yes'
@@ -795,7 +838,7 @@ render_summary() {
   say "Host log: $LOG_FILE"
 }
 
-say "SSHhole All-in-One v1.5 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE openrc_restart=$ALLOW_OPENRC_RESTART"
+say "SSHhole All-in-One v1.6 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE openrc_restart=$ALLOW_OPENRC_RESTART"
 say "Host OS: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | tr -d '"')"
 say 'Policy: never change SSH auth/port/password/key config; no VM restart; no image rebuild.'
 if [ "$ACTION" = fix ]; then say '[AUTO-FIX] Vulnerable Alpine OpenSSH will be upgraded in place; already-safe targets left unchanged.'; fi
