@@ -3,7 +3,7 @@
 # Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
 # Safe baseline: do not change authentication, users, keys, passwords, ports,
 # SSH daemon config, host firewall, repositories, container lifecycle or images.
-# Updated: 2026-11-06 (v1.1). POSIX sh, BusyBox ash compatible.
+# Updated: 2026-11-06 (v1.2). POSIX sh, BusyBox ash compatible.
 set -u
 umask 077
 
@@ -12,6 +12,8 @@ SCOPE=all
 ENGINE=all
 RELOAD=yes
 RUNMAN_DATA_DIR=
+COLOR_MODE=auto
+COLOR_ON=no
 SUMMARY_OK=0
 SUMMARY_SAFE=0
 SUMMARY_RISK=0
@@ -33,6 +35,7 @@ Options:
   --engine all|docker|podman|incus|lxd|runman
                                 Default: all; only limits container managers
   --no-reload                   Install patches, do NOT HUP sshd (reports pending)
+  --color auto|always|never     Colored terminal status table (default: auto)
   --runman-data-dir /ABS/PATH   Override Rust Runman v2 persistent data directory
   -h, --help                    Help
 
@@ -55,17 +58,23 @@ while [ "$#" -gt 0 ]; do
     --scope) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; SCOPE=$2; shift ;;
     --engine) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ENGINE=$2; shift ;;
     --no-reload) RELOAD=no ;;
+    --color) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; COLOR_MODE=$2; shift ;;
     --runman-data-dir) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; RUNMAN_DATA_DIR=$2; shift ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
   esac
   shift
 done
+case "$COLOR_MODE" in auto|always|never) ;; *) echo "Invalid --color" >&2; exit 64 ;; esac
 case "$SCOPE" in all|host|containers) ;; *) echo 'Invalid --scope' >&2; exit 64 ;; esac
 case "$ENGINE" in all|docker|podman|incus|lxd|runman) ;; *) echo 'Invalid --engine' >&2; exit 64 ;; esac
 case "$RUNMAN_DATA_DIR" in '') ;; /*) ;; *) echo '--runman-data-dir must be absolute' >&2; exit 64 ;; esac
 [ "$(id -u)" = 0 ] || { echo 'Run as root on the host.' >&2; exit 1; }
 
+case "$COLOR_MODE" in
+  always) COLOR_ON=yes ;;
+  auto) if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then COLOR_ON=yes; fi ;;
+esac
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sshhole-all.XXXXXXXX") || exit 1
 cleanup() { [ -z "$WORK" ] || rm -rf -- "$WORK"; }
 trap 'cleanup' 0
@@ -77,6 +86,13 @@ else
   LOG_FILE="/tmp/sshhole-all-$(date +%Y%m%d-%H%M%S)-$$.log"
 fi
 : > "$LOG_FILE" || { echo 'Cannot create host log' >&2; exit 1; }
+# Command substitution removes trailing tabs; build a reliable TAB character.
+TAB=$(printf '\tX')
+TAB=${TAB%X}
+RESULTS_FILE="$WORK/results.tsv"
+ENGINES_FILE="$WORK/engines.tsv"
+: > "$RESULTS_FILE"
+: > "$ENGINES_FILE"
 
 say() { printf '%s\n' "$*" | tee -a "$LOG_FILE"; }
 want_engine() { [ "$ENGINE" = all ] || [ "$ENGINE" = "$1" ]; }
@@ -319,23 +335,54 @@ finish OK 0
 GUEST_WORKER
 }
 
+# Log text stays free of ANSI escapes. Final table colors only the terminal.
+engine_record() {
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$ENGINES_FILE"
+  say "[ENGINE] $1: $2 ($3)"
+}
+
+record_failure() {
+  fail_engine=$1
+  fail_target=$2
+  fail_msg=$3
+  SUMMARY_FAIL=$((SUMMARY_FAIL+1))
+  SUMMARY_TOTAL=$((SUMMARY_TOTAL+1))
+  printf '%s\t%s\t%s\t%s\t%s\n' "$fail_engine" "$fail_target" '-' 'FAIL' "$fail_msg" >> "$RESULTS_FILE"
+  say "[ERROR] $fail_engine/$fail_target: $fail_msg"
+}
+
 show_result() {
   label=$1
   response=$2
   rc=$3
   SUMMARY_TOTAL=$((SUMMARY_TOTAL + 1))
   say "----- $label -----"
-  # Guest does not print passwords, keys or complete sshd configs.
   cat "$response" | tee -a "$LOG_FILE"
   status=$(sed -n 's/^SSHH_RESULT=//p' "$response" | tail -n 1)
-  case "$status" in
-    OK) SUMMARY_OK=$((SUMMARY_OK+1)) ;;
-    SAFE) SUMMARY_SAFE=$((SUMMARY_SAFE+1)) ;;
-    RISK) SUMMARY_RISK=$((SUMMARY_RISK+1)) ;;
-    PENDING) SUMMARY_PENDING=$((SUMMARY_PENDING+1)) ;;
-    SKIP) SUMMARY_SKIP=$((SUMMARY_SKIP+1)) ;;
-    *) SUMMARY_FAIL=$((SUMMARY_FAIL+1)); say "[ERROR] execution exit_code=$rc status=${status:-missing}" ;;
+  case "$status:$rc" in
+    OK:0) SUMMARY_OK=$((SUMMARY_OK+1)) ;;
+    SAFE:0) SUMMARY_SAFE=$((SUMMARY_SAFE+1)) ;;
+    RISK:3) SUMMARY_RISK=$((SUMMARY_RISK+1)) ;;
+    PENDING:4) SUMMARY_PENDING=$((SUMMARY_PENDING+1)) ;;
+    SKIP:0) SUMMARY_SKIP=$((SUMMARY_SKIP+1)) ;;
+    *) status=FAIL; SUMMARY_FAIL=$((SUMMARY_FAIL+1)); say "[ERROR] execution exit_code=$rc guest_result=$(sed -n 's/^SSHH_RESULT=//p' "$response" | tail -n 1)" ;;
   esac
+  # Last matching status line is used as a short explanation in the report.
+  case "$status" in
+    SAFE|OK|RISK|PENDING|SKIP)
+      note=$(awk -v s="[$status]" 'index($0,s)==1 {v=substr($0,length(s)+2)} END{print v}' "$response") ;;
+    FAIL)
+      note=$(awk '/^\[(ERROR|FAIL|WARN)\]/{v=$0} END{print v}' "$response") ;;
+  esac
+  [ -n "$note" ] || note="See detailed log (exit=$rc)"
+  os=$(sed -n 's/^\[INFO\] Alpine=\([^ ]*\).*/Alpine \1/p' "$response" | head -n 1)
+  if [ -z "$os" ]; then
+    if [ "$status" = SKIP ]; then os='Other OS'; else os='Unknown'; fi
+  fi
+  kind=${label%%:*}
+  if [ "$kind" = "$label" ]; then target=$label; else target=${label#*:}; fi
+  note=$(printf '%s' "$note" | tr '\t\r\n' '   ')
+  printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$target" "$os" "$status" "$note" >> "$RESULTS_FILE"
 }
 
 run_target() {
@@ -350,14 +397,19 @@ run_target() {
 
 scan_oci() {
   engine=$1
-  command -v "$engine" >/dev/null 2>&1 || return 0
+  if ! command -v "$engine" >/dev/null 2>&1; then
+    engine_record "$engine" NOT_INSTALLED 'CLI not found; no containers scanned'
+    return
+  fi
   ids="$WORK/$engine.ids"
   if ! "$engine" ps --no-trunc --format '{{.ID}}' > "$ids" 2> "$WORK/$engine.err"; then
-    say "[WARN] $engine unavailable / no permission: $(head -n 1 "$WORK/$engine.err")"
-    return 0
+    msg=$(head -n 1 "$WORK/$engine.err")
+    engine_record "$engine" ERROR 'Cannot list containers'
+    record_failure "$engine" '(discovery)' "ps failed: $msg"
+    return
   fi
   count=$(grep -c . "$ids" || true)
-  say "[INFO] $engine running containers=$count (root-visible daemon/namespace only)"
+  engine_record "$engine" SCANNED "running=$count (root-visible only)"
   image_update_needed=no
   while IFS= read -r id || [ -n "$id" ]; do
     [ -n "$id" ] || continue
@@ -369,42 +421,89 @@ scan_oci() {
     fi
   done < "$ids"
   if [ "$image_update_needed" = yes ]; then
-    say "[WARN] $engine: OpenSSH was upgraded inside running container(s); original image/Dockerfile may still be vulnerable. Update image before re-create/redeploy."
+    say "[WARN] $engine: OpenSSH updated in running container(s); update original images/Dockerfiles before re-create or redeploy."
   fi
 }
 
+# Incus/LXD: CLI's column "t" means PERSISTENT/EPHEMERAL, NOT container/VM!
+# Prefer type=container status=running server-side filters with all-projects.
+# Fallback to per-project listing for older management clients.
 scan_incus_like() {
   engine=$1
-  command -v "$engine" >/dev/null 2>&1 || return 0
-  projects="$WORK/$engine.projects"
-  # Names only, avoiding dependency on jq/yq; Incus and LXD support -c n csv.
-  if ! "$engine" project list --columns n --format csv,noheader > "$projects" 2> "$WORK/$engine.err"; then
-    say "[WARN] $engine project listing failed; NOT assuming default is exhaustive"
-    return 0
+  if ! command -v "$engine" >/dev/null 2>&1; then
+    engine_record "$engine" NOT_INSTALLED 'CLI not found; no instances scanned'
+    return
   fi
+  items="$WORK/$engine.items"
+  if "$engine" list --all-projects type=container status=running --columns nse --format csv,noheader > "$items" 2> "$WORK/$engine.err"; then
+    count=0
+    while IFS=, read -r name state project rest || [ -n "$name" ]; do
+      [ -n "$name" ] || continue
+      state_u=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
+      [ "$state_u" = RUNNING ] || {
+        record_failure "$engine" "(discovery:$name)" "unexpected instance state in CSV: $state"
+        continue
+      }
+      [ -n "$project" ] || {
+        record_failure "$engine" "(discovery:$name)" 'missing project in all-project CSV'
+        continue
+      }
+      count=$((count+1))
+      run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+    done < "$items"
+    engine_record "$engine" SCANNED "all-projects; running containers=$count"
+    return
+  fi
+  say "[WARN] $engine --all-projects failed: $(head -n 1 "$WORK/$engine.err"); trying per-project enumeration"
+  projects="$WORK/$engine.projects"
+  if ! "$engine" project list --columns n --format csv,noheader > "$projects" 2> "$WORK/$engine.err"; then
+    msg=$(head -n 1 "$WORK/$engine.err")
+    engine_record "$engine" ERROR 'All-project and project-list discovery failed'
+    record_failure "$engine" '(discovery)' "project list failed: $msg"
+    return
+  fi
+  count=0
+  projects_total=0
+  failed_projects=0
   while IFS= read -r project || [ -n "$project" ]; do
     [ -n "$project" ] || continue
-    items="$WORK/$engine.items"
-    if ! "$engine" list --project "$project" --columns nts --format csv,noheader > "$items" 2> "$WORK/$engine.err"; then
-      say "[WARN] $engine project=$project list failed; skipped"
+    projects_total=$((projects_total+1))
+    items="$WORK/$engine.$projects_total.items"
+    if ! "$engine" list --project "$project" type=container status=running --columns ns --format csv,noheader > "$items" 2> "$WORK/$engine.err"; then
+      failed_projects=$((failed_projects+1))
+      record_failure "$engine" "project:$project" "instance list failed: $(head -n 1 "$WORK/$engine.err")"
       continue
     fi
-    # Format: name,type,status. VM types are deliberately ignored.
-    while IFS=, read -r name kind status || [ -n "$name" ]; do
+    while IFS=, read -r name state rest || [ -n "$name" ]; do
       [ -n "$name" ] || continue
-      kind_u=$(printf '%s' "$kind" | tr '[:lower:]' '[:upper:]')
-      status_u=$(printf '%s' "$status" | tr '[:lower:]' '[:upper:]')
-      [ "$status_u" = RUNNING ] || continue
-      case "$kind_u" in CONTAINER) ;; *) continue ;; esac
+      state_u=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
+      [ "$state_u" = RUNNING ] || {
+        record_failure "$engine" "project:$project/$name" "unexpected instance state: $state"
+        continue
+      }
+      count=$((count+1))
       run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD"
     done < "$items"
   done < "$projects"
+  if [ "$projects_total" -eq 0 ]; then
+    record_failure "$engine" '(discovery)' 'project enumeration returned no projects; cannot assert full coverage'
+  fi
+  if [ "$failed_projects" -gt 0 ]; then
+    engine_record "$engine" PARTIAL "projects=$projects_total failed=$failed_projects running_containers=$count"
+  else
+    engine_record "$engine" SCANNED "projects=$projects_total running_containers=$count"
+  fi
 }
 
 scan_runman() {
-  command -v runman-agent >/dev/null 2>&1 || return 0
+  if ! command -v runman-agent >/dev/null 2>&1; then
+    engine_record runman NOT_INSTALLED 'Rust Runman v2 CLI not found'
+    return
+  fi
   if ! command -v systemctl >/dev/null 2>&1; then
-    say '[WARN] Rust Runman v2 needs systemd; unavailable, skipping Runman runtime'; return 0
+    engine_record runman ERROR 'systemctl missing; unable to inspect Runman runtime'
+    record_failure runman '(discovery)' 'systemctl missing'
+    return
   fi
   if [ -n "$RUNMAN_DATA_DIR" ]; then
     dir=$RUNMAN_DATA_DIR
@@ -418,9 +517,9 @@ scan_runman() {
     fi
   fi
   case "$dir" in
-    /*) ;; *) say "[WARN] Invalid Runman data_dir=$dir; skipped"; return 0 ;;
+    /*) ;; *) engine_record runman ERROR 'Invalid Runman data_dir'; record_failure runman '(discovery)' "invalid data_dir=$dir"; return ;;
   esac
-  [ -d "$dir/instances" ] || { say '[INFO] No Rust Runman v2 instance directory'; return 0; }
+  [ -d "$dir/instances" ] || { engine_record runman NO_INSTANCES 'Rust Runman v2 instance directory missing'; return; }
   say "[INFO] Rust Runman v2 persistent dir=$dir; using native __exec (not SSH)"
   count=0
   image_update_needed=no
@@ -434,28 +533,85 @@ scan_runman() {
     unit="runman-$id.service"
     systemctl is-active --quiet "$unit" 2>/dev/null || continue
     pidfile="/run/runman-agent/$id/init.pid"
-    [ -r "$pidfile" ] || { say "[WARN] $unit active but init.pid missing; skip"; continue; }
+    [ -r "$pidfile" ] || { record_failure runman "$id" 'unit active but init.pid missing'; continue; }
     pid=$(cat "$pidfile" 2>/dev/null | tr -d '[:space:]')
-    case "$pid" in ''|*[!0-9]*) say "[WARN] invalid Runman PID for $id"; continue ;; esac
-    [ -r "/proc/$pid/cgroup" ] || continue
+    case "$pid" in ''|*[!0-9]*) record_failure runman "$id" 'invalid Runman PID'; continue ;; esac
+    [ -r "/proc/$pid/cgroup" ] || { record_failure runman "$id" 'cannot read Runman init cgroup'; continue; }
     if ! grep -Fq "$unit" "/proc/$pid/cgroup"; then
-      say "[WARN] Runman $id PID does not belong to $unit cgroup; skip"; continue
+      record_failure runman "$id" 'init PID not in expected cgroup'; continue
     fi
     count=$((count+1))
     cg="/sys/fs/cgroup/system.slice/$unit"
-    [ -d "$cg" ] || { say "[WARN] missing cgroup for $id"; continue; }
+    [ -d "$cg" ] || { record_failure runman "$id" 'unit cgroup path missing'; continue; }
     run_target "runman:$id" runman-agent __exec "$pidfile" "$cg" -- /bin/sh -s -- "$ACTION" "$RELOAD"
     if grep -qx 'SSHH_PACKAGE_UPDATED=yes' "$WORK/guest-result"; then
       image_update_needed=yes
     fi
   done
-  say "[INFO] Rust Runman v2 running records examined=$count"
+  engine_record runman SCANNED "running_records=$count (native __exec)"
   if [ "$image_update_needed" = yes ]; then
     say '[WARN] Runman: OpenSSH was upgraded in existing guest(s). Refresh Alpine base images before new VPS/reinstall.'
   fi
 }
 
-say "SSHhole All-in-One | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD"
+render_row() {
+  row_engine=$1; row_target=$2; row_os=$3; row_state=$4; row_reason=$5
+  # Bound display length only; full original content remains in plain logfile.
+  case "$row_state" in
+    SAFE|OK) col='\033[1;32m' ;;
+    RISK|FAIL) col='\033[1;31m' ;;
+    PENDING) col='\033[1;33m' ;;
+    SKIP) col='\033[0;90m' ;;
+    *) col='\033[0m' ;;
+  esac
+  # Print ANSI only around status field and only when colors are enabled.
+  printf '%-8.8s | %-45.45s | %-15.15s | ' "$row_engine" "$row_target" "$row_os"
+  if [ "$COLOR_ON" = yes ]; then printf "$col"; fi
+  printf '%-8.8s' "$row_state"
+  if [ "$COLOR_ON" = yes ]; then printf '\033[0m'; fi
+  printf ' | %.70s\n' "$row_reason"
+  printf '%-8.8s | %-45.45s | %-15.15s | %-8.8s | %.70s\n' "$row_engine" "$row_target" "$row_os" "$row_state" "$row_reason" >> "$LOG_FILE"
+}
+
+render_summary() {
+  say ''
+  say '============================ CONTAINER MANAGERS ============================'
+  while IFS="$TAB" read -r mgr st notes || [ -n "$mgr" ]; do
+    [ -n "$mgr" ] || continue
+    printf '%-9.9s | %-14.14s | %s\n' "$mgr" "$st" "$notes"
+  done < "$ENGINES_FILE"
+  say ''
+  say '================================ RESULTS =================================='
+  say 'ENGINE   | TARGET                                        | OS              | STATUS   | DETAILS'
+  say '---------+-----------------------------------------------+-----------------+----------+--------------------------------'
+  while IFS="$TAB" read -r mgr target os st notes || [ -n "$mgr" ]; do
+    [ -n "$mgr" ] || continue
+    render_row "$mgr" "$target" "$os" "$st" "$notes"
+  done < "$RESULTS_FILE"
+  say '---------------------------------------------------------------------------'
+  say "SUMMARY total=$SUMMARY_TOTAL safe=$SUMMARY_SAFE ok=$SUMMARY_OK vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
+  if [ "$SUMMARY_FAIL" -gt 0 ]; then
+    outcome='INCOMPLETE / CHECK FAILED'
+    color='\033[1;31m'
+  elif [ "$SUMMARY_RISK" -gt 0 ]; then
+    outcome='VULNERABLE INSTANCES FOUND'
+    color='\033[1;31m'
+  elif [ "$SUMMARY_PENDING" -gt 0 ]; then
+    outcome='PATCHED BUT RELOAD PENDING'
+    color='\033[1;33m'
+  else
+    outcome='NO KNOWN VULNERABILITY FOUND IN SCANNED TARGETS'
+    color='\033[1;32m'
+  fi
+  if [ "$COLOR_ON" = yes ]; then printf "$color"; fi
+  printf 'OVERALL: %s\n' "$outcome"
+  if [ "$COLOR_ON" = yes ]; then printf '\033[0m'; fi
+  printf 'OVERALL: %s\n' "$outcome" >> "$LOG_FILE"
+  say 'NOTE: Rootless Podman of other users and stopped instances are not scanned.'
+  say "Host log: $LOG_FILE"
+}
+
+say "SSHhole All-in-One v1.2 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE"
 say "Host OS: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | tr -d '"')"
 say 'Policy: never change SSH auth/port/password/key config; no VM restart; no image rebuild.'
 if [ "$SCOPE" = all ] || [ "$SCOPE" = host ]; then
@@ -468,8 +624,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = containers ]; then
   if want_engine lxd; then scan_incus_like lxc; fi
   if want_engine runman; then scan_runman; fi
 fi
-say "SUMMARY total=$SUMMARY_TOTAL safe=$SUMMARY_SAFE ok=$SUMMARY_OK vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
-say "Host log: $LOG_FILE"
+render_summary
 if [ "$SUMMARY_FAIL" -gt 0 ]; then exit 2; fi
 if [ "$SUMMARY_RISK" -gt 0 ] || [ "$SUMMARY_PENDING" -gt 0 ]; then exit 3; fi
 exit 0
