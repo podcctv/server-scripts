@@ -3,7 +3,7 @@
 # Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
 # Safe baseline: do not change authentication, users, keys, passwords, ports,
 # SSH daemon config, host firewall, repositories, container lifecycle or images.
-# Updated: 2026-11-06 (v1.4). POSIX sh, BusyBox ash compatible.
+# Updated: 2026-11-06 (v1.5). POSIX sh, BusyBox ash compatible.
 set -u
 umask 077
 
@@ -16,7 +16,9 @@ RUNMAN_DATA_DIR=
 COLOR_MODE=auto
 COLOR_ON=no
 SUMMARY_OK=0
+SUMMARY_FIXED=0
 SUMMARY_SAFE=0
+SUMMARY_UNVERIFIED=0
 SUMMARY_RISK=0
 SUMMARY_PENDING=0
 SUMMARY_SKIP=0
@@ -45,7 +47,9 @@ Options:
 Host may be Alpine, Debian or Ubuntu. Guest must be Alpine Linux with APK OpenSSH.
 All running instances are examined; stopped instances are never started.
 SAFE means no OpenSSH server is detected (safe against this OpenSSH issue),
-OK means installed OpenSSH reaches the patched threshold. SKIP means out of scope.
+OK means already-patched OpenSSH. FIXED(OK) means this run patched it and verified
+the relevant running service (or found no running sshd). SKIP means out of scope.
+UNVERIFIED means the image could not be audited reliably; never assume safe.
 No repository rewrites / full distribution upgrades / user or SSH config changes.
 Uses SIGHUP only on a PID-file-verified SSH listener; if uncertain, leaves a
 PENDING_RELOAD item (the disk is patched but live daemon may still be vulnerable).
@@ -325,7 +329,14 @@ esac
 if [ "$old" = yes ]; then
   out "[INFO] OpenSSH successfully upgraded from $ver to $new"
   out 'SSHH_PACKAGE_UPDATED=yes'
+  success='FIXED(OK)'
+else
+  success=OK
 fi
+success_done() {
+  out "[$success] $1"
+  finish "$success" 0
+}
 
 config_fingerprints > "$TMP/config.after"
 if ! cmp -s "$TMP/config.before" "$TMP/config.after"; then
@@ -343,7 +354,7 @@ if [ "$before_valid" = yes ]; then
   fi
 fi
 if [ "$RELOAD" = no ] && [ -z "$master_pid" ] && ! pidof sshd >/dev/null 2>&1; then
-  out '[OK] No SSH listener to reload'; finish OK 0
+  success_done 'No SSH listener to reload; patched version verified'
 fi
 if [ "$RELOAD" = no ]; then
   out '[PENDING] --no-reload: package patched but listening daemon may still be stale'
@@ -362,13 +373,12 @@ if [ -z "$master_pid" ]; then
         out '[FAIL] OpenRC sshd did not report running after restart'
         finish FAIL 2
       fi
-      out '[OK] OpenRC sshd restarted with patched package; configuration unchanged'
-      finish OK 0
+      success_done 'OpenRC sshd restarted with patched package; configuration unchanged'
     fi
     out '[PENDING] sshd running without trusted master pidfile; not restarted automatically'
     finish PENDING 4
   fi
-  out '[OK] sshd is not running (nothing to reload)'; finish OK 0
+  success_done 'sshd is not running; patched version verified on disk'
 fi
 if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = sshd ] && [ "$master_pid" = 1 ]; then
   out '[PENDING] sshd is PID 1 (application container); refuse SIGHUP to protect container lifecycle'
@@ -379,7 +389,7 @@ if [ "$before_valid" != yes ]; then
   finish PENDING 4
 fi
 if [ "$old" = no ] && [ "$stale" = no ]; then
-  out '[OK] Patched package and listener already match; no signal necessary'; finish OK 0
+  success_done 'Patched package and listener already match; no signal necessary'
 fi
 # Never HUP a custom sshd binary. Re-exec would otherwise reload the wrong binary.
 if command -v readlink >/dev/null 2>&1 && [ -L "/proc/$master_pid/exe" ]; then
@@ -414,8 +424,7 @@ if [ -r "/proc/$new_pid/exe" ] && command -v cmp >/dev/null 2>&1 && ! cmp -s "/p
   out '[PENDING] Listener still differs from disk binary after SIGHUP; investigate manually'
   finish PENDING 4
 fi
-out "[OK] SSH listener re-executed / verified PID=$new_pid; login policy unchanged"
-finish OK 0
+success_done "SSH listener re-executed / verified PID=$new_pid; login policy unchanged"
 GUEST_WORKER
 }
 
@@ -445,6 +454,8 @@ show_result() {
   status=$(sed -n 's/^SSHH_RESULT=//p' "$response" | tail -n 1)
   case "$status:$rc" in
     OK:0) SUMMARY_OK=$((SUMMARY_OK+1)) ;;
+    'FIXED(OK):0') SUMMARY_FIXED=$((SUMMARY_FIXED+1)) ;;
+    UNVERIFIED:5) SUMMARY_UNVERIFIED=$((SUMMARY_UNVERIFIED+1)) ;;
     SAFE:0) SUMMARY_SAFE=$((SUMMARY_SAFE+1)) ;;
     RISK:3) SUMMARY_RISK=$((SUMMARY_RISK+1)) ;;
     PENDING:4) SUMMARY_PENDING=$((SUMMARY_PENDING+1)) ;;
@@ -453,7 +464,7 @@ show_result() {
   esac
   # Last matching status line is used as a short explanation in the report.
   case "$status" in
-    SAFE|OK|RISK|PENDING|SKIP)
+    SAFE|OK|'FIXED(OK)'|RISK|PENDING|SKIP|UNVERIFIED)
       note=$(awk -v s="[$status]" 'index($0,s)==1 {v=substr($0,length(s)+2)} END{print v}' "$response") ;;
     FAIL)
       note=$(awk '/^\[(ERROR|FAIL|WARN)\]/{v=$0} END{print v}' "$response") ;;
@@ -479,6 +490,68 @@ run_target() {
   show_result "$label" "$tmp" "$rc"
 }
 
+# CLI output can become stale during a large scan. Re-check each container's
+# running state and do not count stop/start races as failed vulnerability checks.
+oci_running() {
+  "$1" inspect -f '{{.State.Running}}' "$2" 2>/dev/null | head -n 1
+}
+
+oci_synthetic() {
+  label=$1
+  state=$2
+  code=$3
+  detail=$4
+  printf '[%s] %s\nSSHH_RESULT=%s\n' "$state" "$detail" "$state" > "$WORK/guest-result"
+  show_result "$label" "$WORK/guest-result" "$code"
+}
+
+# Shell-less/distroless OCI containers: read-only, offline OS identification via
+# Docker/Podman cp. Never insert binaries, edit the filesystem or start a stopped
+# container to get a result. Failure to prove non-Alpine is UNVERIFIED, not SAFE.
+oci_probe_no_shell() {
+  engine=$1
+  id=$2
+  label=$3
+  probe=$(mktemp -d "$WORK/oci-probe.XXXXXXXX") || {
+    oci_synthetic "$label" UNVERIFIED 5 'No /bin/sh and cannot create audit directory'
+    return
+  }
+  os_id=''
+  alpine_release=''
+  if "$engine" cp -L "$id:/etc/os-release" "$probe/os-release" >/dev/null 2>&1 && [ -f "$probe/os-release" ]; then
+    os_id=$(sed -n 's/^ID=//p' "$probe/os-release" | head -n 1 | tr -d "\"'[:space:]")
+  fi
+  if "$engine" cp -L "$id:/etc/alpine-release" "$probe/alpine-release" >/dev/null 2>&1 && [ -s "$probe/alpine-release" ]; then
+    alpine_release=$(head -n 1 "$probe/alpine-release")
+  fi
+  if [ -n "$alpine_release" ] || [ "$os_id" = alpine ]; then
+    if "$engine" cp -L "$id:/lib/apk/db/installed" "$probe/installed" >/dev/null 2>&1 && [ -f "$probe/installed" ]; then
+      open_pkg=$(awk '/^P:openssh-server(-pam|-krb5)?$/ {print substr($0,3); exit}' "$probe/installed")
+      if [ -n "$open_pkg" ]; then
+        ver=$(awk -v want="$open_pkg" '/^P:/ {p=substr($0,3)} /^V:/ {if(p==want){print substr($0,3);exit}} /^$/ {p=""}' "$probe/installed")
+        oci_synthetic "$label" UNVERIFIED 5 "Alpine $alpine_release: $open_pkg=$ver but /bin/sh missing; cannot safely upgrade or validate running sshd"
+      else
+        # In addition to package DB, check standard sshd paths for custom builds.
+        has_ssh=no
+        for loc in /usr/sbin/sshd /usr/local/sbin/sshd /usr/bin/sshd; do
+          if "$engine" cp -L "$id:$loc" "$probe/sshd-probe" >/dev/null 2>&1; then has_ssh=yes; break; fi
+        done
+        if [ "$has_ssh" = yes ]; then
+          oci_synthetic "$label" UNVERIFIED 5 'Alpine shell-less image has custom sshd binary; manual audit required'
+        else
+          oci_synthetic "$label" SAFE 0 "Alpine $alpine_release shell-less image: APK DB has no OpenSSH server and no standard sshd binary"
+        fi
+      fi
+    else
+      oci_synthetic "$label" UNVERIFIED 5 "Alpine $alpine_release image without /bin/sh: APK installed database unavailable"
+    fi
+  elif [ -n "$os_id" ]; then
+    oci_synthetic "$label" SKIP 0 "Shell-less image identified as $os_id (not Alpine); no Alpine OpenSSH patch needed"
+  else
+    oci_synthetic "$label" UNVERIFIED 5 'No /bin/sh and OS identity unavailable; cannot prove absence of OpenSSH, manual review needed'
+  fi
+}
+
 scan_oci() {
   engine=$1
   if ! command -v "$engine" >/dev/null 2>&1; then
@@ -493,13 +566,37 @@ scan_oci() {
     return
   fi
   count=$(grep -c . "$ids" || true)
-  engine_record "$engine" SCANNED "running=$count (root-visible only)"
+  engine_record "$engine" SCANNED "running_at_discovery=$count (root-visible only)"
   image_update_needed=no
   while IFS= read -r id || [ -n "$id" ]; do
     [ -n "$id" ] || continue
     name=$("$engine" inspect -f '{{.Name}}' "$id" 2>/dev/null | head -n 1)
     [ -n "$name" ] || name=$id
-    run_target "$engine:$name" "$engine" exec -u 0 -i "$id" /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART"
+    label="$engine:$name"
+    state=$(oci_running "$engine" "$id")
+    if [ "$state" = false ]; then
+      oci_synthetic "$label" SKIP 0 'Container stopped during discovery; no exec performed'
+      continue
+    fi
+    if [ "$state" != true ]; then
+      oci_synthetic "$label" UNVERIFIED 5 'Cannot confirm container running state; no exec performed'
+      continue
+    fi
+    guest_script | "$engine" exec -u 0 -i "$id" /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART" > "$WORK/guest-result" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ] && ! grep -q '^SSHH_RESULT=' "$WORK/guest-result"; then
+      # OCI daemon may report a stopped state after ps -- inspect it again.
+      state=$(oci_running "$engine" "$id")
+      if [ "$state" = false ]; then
+        oci_synthetic "$label" SKIP 0 'Container stopped between discovery and exec; no vulnerability verdict'
+      elif grep -Eiq '(/bin/sh.*(no such file|not found)|executable file not found.*(/bin/sh|sh)|stat /bin/sh)' "$WORK/guest-result"; then
+        oci_probe_no_shell "$engine" "$id" "$label"
+      else
+        show_result "$label" "$WORK/guest-result" "$rc"
+      fi
+    else
+      show_result "$label" "$WORK/guest-result" "$rc"
+    fi
     if grep -qx 'SSHH_PACKAGE_UPDATED=yes' "$WORK/guest-result"; then
       image_update_needed=yes
     fi
@@ -642,19 +739,19 @@ render_row() {
   row_engine=$1; row_target=$2; row_os=$3; row_state=$4; row_reason=$5
   # Bound display length only; full original content remains in plain logfile.
   case "$row_state" in
-    SAFE|OK) col='\033[1;32m' ;;
+    SAFE|OK|'FIXED(OK)') col='\033[1;32m' ;;
     RISK|FAIL) col='\033[1;31m' ;;
-    PENDING) col='\033[1;33m' ;;
+    PENDING|UNVERIFIED) col='\033[1;33m' ;;
     SKIP) col='\033[0;90m' ;;
     *) col='\033[0m' ;;
   esac
   # Print ANSI only around status field and only when colors are enabled.
   printf '%-8.8s | %-45.45s | %-15.15s | ' "$row_engine" "$row_target" "$row_os"
   if [ "$COLOR_ON" = yes ]; then printf "$col"; fi
-  printf '%-8.8s' "$row_state"
+  printf '%-11.11s' "$row_state"
   if [ "$COLOR_ON" = yes ]; then printf '\033[0m'; fi
   printf ' | %.70s\n' "$row_reason"
-  printf '%-8.8s | %-45.45s | %-15.15s | %-8.8s | %.70s\n' "$row_engine" "$row_target" "$row_os" "$row_state" "$row_reason" >> "$LOG_FILE"
+  printf '%-8.8s | %-45.45s | %-15.15s | %-11.11s | %.70s\n' "$row_engine" "$row_target" "$row_os" "$row_state" "$row_reason" >> "$LOG_FILE"
 }
 
 render_summary() {
@@ -666,14 +763,14 @@ render_summary() {
   done < "$ENGINES_FILE"
   say ''
   say '================================ RESULTS =================================='
-  say 'ENGINE   | TARGET                                        | OS              | STATUS   | DETAILS'
-  say '---------+-----------------------------------------------+-----------------+----------+--------------------------------'
+  say 'ENGINE   | TARGET                                        | OS              | STATUS      | DETAILS'
+  say '---------+-----------------------------------------------+-----------------+-------------+--------------------------------'
   while IFS="$TAB" read -r mgr target os st notes || [ -n "$mgr" ]; do
     [ -n "$mgr" ] || continue
     render_row "$mgr" "$target" "$os" "$st" "$notes"
   done < "$RESULTS_FILE"
   say '---------------------------------------------------------------------------'
-  say "SUMMARY total=$SUMMARY_TOTAL safe=$SUMMARY_SAFE ok=$SUMMARY_OK vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
+  say "SUMMARY total=$SUMMARY_TOTAL safe=$SUMMARY_SAFE ok=$SUMMARY_OK fixed=$SUMMARY_FIXED vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING unverified=$SUMMARY_UNVERIFIED skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
   if [ "$SUMMARY_FAIL" -gt 0 ]; then
     outcome='INCOMPLETE / CHECK FAILED'
     color='\033[1;31m'
@@ -682,6 +779,9 @@ render_summary() {
     color='\033[1;31m'
   elif [ "$SUMMARY_PENDING" -gt 0 ]; then
     outcome='PATCHED BUT RELOAD PENDING'
+    color='\033[1;33m'
+  elif [ "$SUMMARY_UNVERIFIED" -gt 0 ]; then
+    outcome='INCOMPLETE / UNVERIFIED CONTAINERS'
     color='\033[1;33m'
   else
     outcome='NO KNOWN VULNERABILITY FOUND IN SCANNED TARGETS'
@@ -695,7 +795,7 @@ render_summary() {
   say "Host log: $LOG_FILE"
 }
 
-say "SSHhole All-in-One v1.4 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE openrc_restart=$ALLOW_OPENRC_RESTART"
+say "SSHhole All-in-One v1.5 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE openrc_restart=$ALLOW_OPENRC_RESTART"
 say "Host OS: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | tr -d '"')"
 say 'Policy: never change SSH auth/port/password/key config; no VM restart; no image rebuild.'
 if [ "$ACTION" = fix ]; then say '[AUTO-FIX] Vulnerable Alpine OpenSSH will be upgraded in place; already-safe targets left unchanged.'; fi
@@ -710,6 +810,6 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = containers ]; then
   if want_engine runman; then scan_runman; fi
 fi
 render_summary
-if [ "$SUMMARY_FAIL" -gt 0 ]; then exit 2; fi
+if [ "$SUMMARY_FAIL" -gt 0 ] || [ "$SUMMARY_UNVERIFIED" -gt 0 ]; then exit 2; fi
 if [ "$SUMMARY_RISK" -gt 0 ] || [ "$SUMMARY_PENDING" -gt 0 ]; then exit 3; fi
 exit 0
