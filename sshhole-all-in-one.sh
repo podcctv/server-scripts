@@ -1,9 +1,9 @@
 #!/bin/sh
-# SSHhole / CVE-2026-123158 remediation for Alpine hosts and Alpine containers.
+# SSHhole OpenSSH password-authentication bypass remediation for Alpine hosts and Alpine containers.
 # Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
 # Safe baseline: do not change authentication, users, keys, passwords, ports,
 # SSH daemon config, host firewall, repositories, container lifecycle or images.
-# Updated: 2026-11-06 (v1.3). POSIX sh, BusyBox ash compatible.
+# Updated: 2026-11-06 (v1.4). POSIX sh, BusyBox ash compatible.
 set -u
 umask 077
 
@@ -11,6 +11,7 @@ ACTION=check
 SCOPE=all
 ENGINE=all
 RELOAD=yes
+ALLOW_OPENRC_RESTART=no
 RUNMAN_DATA_DIR=
 COLOR_MODE=auto
 COLOR_ON=no
@@ -28,20 +29,22 @@ usage() {
   cat <<'USAGE'
 Usage:
   sh sshhole-all-in-one.sh --check [options]       # default: audit only
-  sh sshhole-all-in-one.sh --fix [options]         # targeted Alpine OpenSSH patch + safe HUP
+  sh sshhole-all-in-one.sh --fix [options]         # scan, auto-patch vulnerable Alpine OpenSSH, verify + safe HUP
 
 Options:
   --scope all|host|containers   Default: all
   --engine all|docker|podman|incus|lxd|runman
                                 Default: all; only limits container managers
   --no-reload                   Install patches, do NOT HUP sshd (reports pending)
+  --allow-openrc-restart        Explicit fallback when sshd is managed by OpenRC but
+                                has no verified master PID (may disconnect sessions)
   --color auto|always|never     Colored terminal status table (default: auto)
   --runman-data-dir /ABS/PATH   Override Rust Runman v2 persistent data directory
   -h, --help                    Help
 
 Host may be Alpine, Debian or Ubuntu. Guest must be Alpine Linux with APK OpenSSH.
 All running instances are examined; stopped instances are never started.
-SAFE means no OpenSSH server is detected (safe against this specific CVE),
+SAFE means no OpenSSH server is detected (safe against this OpenSSH issue),
 OK means installed OpenSSH reaches the patched threshold. SKIP means out of scope.
 No repository rewrites / full distribution upgrades / user or SSH config changes.
 Uses SIGHUP only on a PID-file-verified SSH listener; if uncertain, leaves a
@@ -58,6 +61,7 @@ while [ "$#" -gt 0 ]; do
     --scope) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; SCOPE=$2; shift ;;
     --engine) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ENGINE=$2; shift ;;
     --no-reload) RELOAD=no ;;
+    --allow-openrc-restart) ALLOW_OPENRC_RESTART=yes ;;
     --color) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; COLOR_MODE=$2; shift ;;
     --runman-data-dir) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; RUNMAN_DATA_DIR=$2; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -105,6 +109,7 @@ set -u
 umask 077
 MODE=${1:-check}
 RELOAD=${2:-yes}
+ALLOW_OPENRC_RESTART=${3:-no}
 
 out() { printf '%s\n' "$*"; }
 finish() { out "SSHH_RESULT=$1"; exit "$2"; }
@@ -225,8 +230,11 @@ SSHD=/usr/sbin/sshd
 
 # Only trust the SSH master PID in a standard pidfile; do NOT signal a session.
 master_pid=''
-for pf in /run/sshd.pid /var/run/sshd.pid; do
-  [ -r "$pf" ] || continue
+# Account for custom PidFile in sshd_config without modifying it.
+configured_pidfile=$("$SSHD" -T 2>/dev/null | awk '$1=="pidfile" {print $2; exit}')
+case "$configured_pidfile" in /*) ;; *) configured_pidfile='' ;; esac
+for pf in "$configured_pidfile" /run/sshd.pid /var/run/sshd.pid; do
+  [ -n "$pf" ] && [ -r "$pf" ] || continue
   pid=$(cat "$pf" 2>/dev/null | tr -d '[:space:]')
   case "$pid" in ''|*[!0-9]*) continue ;; esac
   [ "$pid" -gt 1 ] 2>/dev/null || continue
@@ -268,7 +276,11 @@ fi
 TMP=$(mktemp -d /tmp/sshhole-guest.XXXXXXXX) || { out '[ERROR] tmp unavailable'; finish FAIL 2; }
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 config_fingerprints() {
-  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*; do
+  # Only hashes, never record private-key or password contents.
+  # This also protects account credentials and host identity from surprise APK hooks.
+  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* \
+           /etc/ssh/ssh_host_* /etc/passwd /etc/shadow /etc/group /etc/gshadow \
+           /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] && sha256sum "$f"
   done
 }
@@ -290,14 +302,18 @@ if [ "$old" = yes ]; then
   out '[ACTION] apk update + targeted upgrade of preinstalled OpenSSH components'
   if ! apk update; then out '[ERROR] apk update failed; repositories unchanged'; finish FAIL 2; fi
   set -- "$pkg"
-  for p in openssh openssh-server-common openssh-server-common-openrc; do
+  # Upgrade *installed* related OpenSSH subpackages, not the entire OS or new
+  # packages. This prevents server/common revisions from diverging on Alpine.
+  for p in openssh openssh-server openssh-server-pam openssh-server-krb5 \
+           openssh-server-common openssh-server-common-openrc \
+           openssh-keygen openssh-sftp-server openssh-client-common; do
     if [ "$p" != "$pkg" ] && apk info -e "$p" >/dev/null 2>&1; then set -- "$@" "$p"; fi
   done
+  out "[ACTION] apk upgrade packages: $*"
   # Upgrade existing dependency graph only; no installs or major-version migrations.
   if ! apk upgrade "$@"; then
     out '[ERROR] APK upgrade failed; examine package state and logs'; finish FAIL 2
   fi
-  out 'SSHH_PACKAGE_UPDATED=yes'
 fi
 new=$(version_of "$pkg")
 [ -n "$new" ] || { out '[ERROR] Post-upgrade package version cannot be read'; finish FAIL 2; }
@@ -306,6 +322,10 @@ case "$post_cmp" in
   '>'|'=') out "[OK] $pkg now $new (patched on disk)" ;;
   *) out "[ERROR] Repo has no verified fix ($pkg=$new, expected >=$min)"; finish FAIL 2 ;;
 esac
+if [ "$old" = yes ]; then
+  out "[INFO] OpenSSH successfully upgraded from $ver to $new"
+  out 'SSHH_PACKAGE_UPDATED=yes'
+fi
 
 config_fingerprints > "$TMP/config.after"
 if ! cmp -s "$TMP/config.before" "$TMP/config.after"; then
@@ -331,7 +351,21 @@ if [ "$RELOAD" = no ]; then
 fi
 if [ -z "$master_pid" ]; then
   if command -v pidof >/dev/null 2>&1 && pidof sshd >/dev/null 2>&1; then
-    out '[PENDING] sshd running without trusted master pidfile; no signal sent'
+    if [ "$ALLOW_OPENRC_RESTART" = yes ] && [ -x /etc/init.d/sshd ] && command -v rc-service >/dev/null 2>&1 \
+        && rc-service sshd status >/dev/null 2>&1 && [ "$before_valid" = yes ]; then
+      out '[WARN] No trusted SSH master PID; explicitly requested OpenRC restart (may disconnect sessions)'
+      if ! rc-service sshd restart; then
+        out '[FAIL] OpenRC sshd restart failed; use provider console to recover'
+        finish FAIL 2
+      fi
+      if ! rc-service sshd status >/dev/null 2>&1; then
+        out '[FAIL] OpenRC sshd did not report running after restart'
+        finish FAIL 2
+      fi
+      out '[OK] OpenRC sshd restarted with patched package; configuration unchanged'
+      finish OK 0
+    fi
+    out '[PENDING] sshd running without trusted master pidfile; not restarted automatically'
     finish PENDING 4
   fi
   out '[OK] sshd is not running (nothing to reload)'; finish OK 0
@@ -363,8 +397,8 @@ if ! kill -HUP "$master_pid" 2>/dev/null; then
 fi
 sleep 1
 new_pid=''
-for pf in /run/sshd.pid /var/run/sshd.pid; do
-  [ -r "$pf" ] || continue
+for pf in "$configured_pidfile" /run/sshd.pid /var/run/sshd.pid; do
+  [ -n "$pf" ] && [ -r "$pf" ] || continue
   p=$(cat "$pf" 2>/dev/null | tr -d '[:space:]')
   case "$p" in ''|*[!0-9]*) continue ;; esac
   if [ -r "/proc/$p/comm" ] && [ "$(cat "/proc/$p/comm" 2>/dev/null)" = sshd ]; then
@@ -465,7 +499,7 @@ scan_oci() {
     [ -n "$id" ] || continue
     name=$("$engine" inspect -f '{{.Name}}' "$id" 2>/dev/null | head -n 1)
     [ -n "$name" ] || name=$id
-    run_target "$engine:$name" "$engine" exec -u 0 -i "$id" /bin/sh -s -- "$ACTION" "$RELOAD"
+    run_target "$engine:$name" "$engine" exec -u 0 -i "$id" /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART"
     if grep -qx 'SSHH_PACKAGE_UPDATED=yes' "$WORK/guest-result"; then
       image_update_needed=yes
     fi
@@ -499,7 +533,7 @@ scan_incus_like() {
         continue
       }
       count=$((count+1))
-      run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+      run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART"
     done < "$items"
     engine_record "$engine" SCANNED "all-projects; running containers=$count"
     return
@@ -532,7 +566,7 @@ scan_incus_like() {
         continue
       }
       count=$((count+1))
-      run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+      run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART"
     done < "$items"
   done < "$projects"
   if [ "$projects_total" -eq 0 ]; then
@@ -593,7 +627,7 @@ scan_runman() {
     count=$((count+1))
     cg="/sys/fs/cgroup/system.slice/$unit"
     [ -d "$cg" ] || { record_failure runman "$id" 'unit cgroup path missing'; continue; }
-    run_target "runman:$id" runman-agent __exec "$pidfile" "$cg" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+    run_target "runman:$id" runman-agent __exec "$pidfile" "$cg" -- /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART"
     if grep -qx 'SSHH_PACKAGE_UPDATED=yes' "$WORK/guest-result"; then
       image_update_needed=yes
     fi
@@ -661,11 +695,12 @@ render_summary() {
   say "Host log: $LOG_FILE"
 }
 
-say "SSHhole All-in-One v1.3 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE"
+say "SSHhole All-in-One v1.4 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE openrc_restart=$ALLOW_OPENRC_RESTART"
 say "Host OS: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | tr -d '"')"
 say 'Policy: never change SSH auth/port/password/key config; no VM restart; no image rebuild.'
+if [ "$ACTION" = fix ]; then say '[AUTO-FIX] Vulnerable Alpine OpenSSH will be upgraded in place; already-safe targets left unchanged.'; fi
 if [ "$SCOPE" = all ] || [ "$SCOPE" = host ]; then
-  run_target 'host' /bin/sh -s -- "$ACTION" "$RELOAD"
+  run_target 'host' /bin/sh -s -- "$ACTION" "$RELOAD" "$ALLOW_OPENRC_RESTART"
 fi
 if [ "$SCOPE" = all ] || [ "$SCOPE" = containers ]; then
   if want_engine docker; then scan_oci docker; fi
