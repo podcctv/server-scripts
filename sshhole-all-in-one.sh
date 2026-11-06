@@ -1,0 +1,452 @@
+#!/bin/sh
+# SSHhole / CVE-2026-123158 remediation for Alpine hosts and Alpine containers.
+# Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
+# Safe baseline: do not change authentication, users, keys, passwords, ports,
+# SSH daemon config, host firewall, repositories, container lifecycle or images.
+# Authoring date: 2026-11-06. POSIX sh, BusyBox ash compatible.
+set -u
+umask 077
+
+ACTION=check
+SCOPE=all
+ENGINE=all
+RELOAD=yes
+RUNMAN_DATA_DIR=
+SUMMARY_OK=0
+SUMMARY_RISK=0
+SUMMARY_PENDING=0
+SUMMARY_SKIP=0
+SUMMARY_FAIL=0
+SUMMARY_TOTAL=0
+LOG_FILE=
+WORK=
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sh sshhole-all-in-one.sh --check [options]       # default: audit only
+  sh sshhole-all-in-one.sh --fix [options]         # targeted Alpine OpenSSH patch + safe HUP
+
+Options:
+  --scope all|host|containers   Default: all
+  --engine all|docker|podman|incus|lxd|runman
+                                Default: all; only limits container managers
+  --no-reload                   Install patches, do NOT HUP sshd (reports pending)
+  --runman-data-dir /ABS/PATH   Override Rust Runman v2 persistent data directory
+  -h, --help                    Help
+
+Host may be Alpine, Debian or Ubuntu. Guest must be Alpine Linux with APK OpenSSH.
+All running instances are examined; stopped instances are never started.
+No repository rewrites / full distribution upgrades / user or SSH config changes.
+Uses SIGHUP only on a PID-file-verified SSH listener; if uncertain, leaves a
+PENDING_RELOAD item (the disk is patched but live daemon may still be vulnerable).
+Container image templates are NOT updated: Docker/Podman re-create needs new image.
+Rootless Podman launched under OTHER users is not discoverable via root's Podman CLI.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check) ACTION=check ;;
+    --fix) ACTION=fix ;;
+    --scope) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; SCOPE=$2; shift ;;
+    --engine) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ENGINE=$2; shift ;;
+    --no-reload) RELOAD=no ;;
+    --runman-data-dir) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; RUNMAN_DATA_DIR=$2; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
+  esac
+  shift
+done
+case "$SCOPE" in all|host|containers) ;; *) echo 'Invalid --scope' >&2; exit 64 ;; esac
+case "$ENGINE" in all|docker|podman|incus|lxd|runman) ;; *) echo 'Invalid --engine' >&2; exit 64 ;; esac
+case "$RUNMAN_DATA_DIR" in '') ;; /*) ;; *) echo '--runman-data-dir must be absolute' >&2; exit 64 ;; esac
+[ "$(id -u)" = 0 ] || { echo 'Run as root on the host.' >&2; exit 1; }
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/sshhole-all.XXXXXXXX") || exit 1
+cleanup() { [ -z "$WORK" ] || rm -rf -- "$WORK"; }
+trap 'cleanup' 0
+trap 'exit 130' 2
+trap 'exit 143' 15
+if [ -d /var/log ] && [ -w /var/log ]; then
+  LOG_FILE="/var/log/sshhole-all-$(date +%Y%m%d-%H%M%S)-$$.log"
+else
+  LOG_FILE="/tmp/sshhole-all-$(date +%Y%m%d-%H%M%S)-$$.log"
+fi
+: > "$LOG_FILE" || { echo 'Cannot create host log' >&2; exit 1; }
+
+say() { printf '%s\n' "$*" | tee -a "$LOG_FILE"; }
+want_engine() { [ "$ENGINE" = all ] || [ "$ENGINE" = "$1" ]; }
+
+# Guest worker stays inline in this one-file installer: stdin is piped to /bin/sh.
+guest_script() {
+cat <<'GUEST_WORKER'
+#!/bin/sh
+set -u
+umask 077
+MODE=${1:-check}
+RELOAD=${2:-yes}
+
+out() { printf '%s\n' "$*"; }
+finish() { out "SSHH_RESULT=$1"; exit "$2"; }
+
+if [ ! -f /etc/alpine-release ] || ! command -v apk >/dev/null 2>&1; then
+  out '[SKIP] Not Alpine or apk unavailable'; finish SKIP 0
+fi
+release=$(cat /etc/alpine-release 2>/dev/null)
+branch=$(printf '%s\n' "$release" | cut -d. -f1,2)
+if grep -Eq '^[[:space:]]*[^#[:space:]].*/edge/main' /etc/apk/repositories 2>/dev/null; then
+  branch=edge
+fi
+case "$branch" in
+  3.16) min=9.0_p1-r6 ;;
+  3.17) min=9.1_p1-r7 ;;
+  3.18) min=9.3_p2-r4 ;;
+  3.19) min=9.6_p1-r3 ;;
+  3.20) min=9.7_p1-r6 ;;
+  3.21) min=9.9_p2-r1 ;;
+  3.22) min=10.0_p1-r11 ;;
+  3.23) min=10.2_p1-r1 ;;
+  3.24) min=10.3_p1-r2 ;;
+  edge) min=10.6_p2-r0 ;;
+  *) out "[WARN] Alpine $release is not in verified fixed-version matrix"; finish FAIL 2 ;;
+esac
+out "[INFO] Alpine=$release branch=$branch minimum_patched=$min"
+
+pkg=''
+for p in openssh-server openssh-server-pam openssh-server-krb5; do
+  if apk info -e "$p" >/dev/null 2>&1; then pkg=$p; break; fi
+done
+if [ -z "$pkg" ]; then
+  if [ -x /usr/sbin/sshd ] || command -v sshd >/dev/null 2>&1; then
+    out '[WARN] Non-APK or unknown sshd; will not replace a custom SSH installation'; finish FAIL 2
+  fi
+  out '[SKIP] No OpenSSH server installed'; finish SKIP 0
+fi
+version_of() {
+  apk info -v "$1" 2>/dev/null | awk -v pre="$1-" 'index($0,pre)==1 {print substr($0,length(pre)+1);exit}'
+}
+ver=$(version_of "$pkg")
+[ -n "$ver" ] || { out '[ERROR] Could not read installed APK version'; finish FAIL 2; }
+compare() {
+  apk version -t "$1" "$2" 2>/dev/null | tr -d '[:space:]'
+}
+cmp=$(compare "$ver" "$min")
+case "$cmp" in
+  '<') old=yes ;;
+  '>'|'=') old=no ;;
+  *) out "[ERROR] Invalid apk version comparison: $cmp"; finish FAIL 2 ;;
+esac
+out "[INFO] $pkg=$ver patched_threshold=$min"
+# Do not report credentials or password hashes.
+if [ -r /etc/shadow ]; then
+  accounts=$(awk -F: '$2=="*" {n++} END {print n+0}' /etc/shadow)
+  sha=$(awk -F: '$2 ~ /^\$[56]\$/ {n++} END {print n+0}' /etc/shadow)
+  out "[INFO] shadow_star_accounts=$accounts sha_crypt_accounts=$sha"
+fi
+SSHD=/usr/sbin/sshd
+[ -x "$SSHD" ] || SSHD=$(command -v sshd 2>/dev/null || true)
+[ -n "$SSHD" ] && [ -x "$SSHD" ] || { out '[ERROR] OpenSSH APK installed but sshd binary missing'; finish FAIL 2; }
+
+# Only trust the SSH master PID in a standard pidfile; do NOT signal a session.
+master_pid=''
+for pf in /run/sshd.pid /var/run/sshd.pid; do
+  [ -r "$pf" ] || continue
+  pid=$(cat "$pf" 2>/dev/null | tr -d '[:space:]')
+  case "$pid" in ''|*[!0-9]*) continue ;; esac
+  [ "$pid" -gt 1 ] 2>/dev/null || continue
+  [ -d "/proc/$pid" ] || continue
+  [ -r "/proc/$pid/comm" ] || continue
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = sshd ] || continue
+  master_pid=$pid
+  break
+done
+if [ -n "$master_pid" ]; then
+  out "[INFO] SSH master PID (pidfile verified)=$master_pid"
+else
+  out '[INFO] No verified SSH listener pidfile (may be inactive/custom/supervised)'
+fi
+stale=no
+if [ -n "$master_pid" ] && [ -r "/proc/$master_pid/exe" ]; then
+  if command -v cmp >/dev/null 2>&1; then
+    if ! cmp -s "/proc/$master_pid/exe" "$SSHD" 2>/dev/null; then stale=yes; fi
+  else
+    exe=$(readlink "/proc/$master_pid/exe" 2>/dev/null || true)
+    case "$exe" in *' (deleted)') stale=yes ;; esac
+  fi
+fi
+
+if [ "$MODE" = check ]; then
+  if [ "$old" = yes ]; then
+    out '[RISK] Vulnerable OpenSSH APK revision (no changes made)'; finish RISK 3
+  fi
+  if [ "$stale" = yes ]; then
+    out '[PENDING] Patched APK on disk but sshd listener still runs a different binary'
+    finish PENDING 4
+  fi
+  out '[OK] Installed OpenSSH server package meets fixed version'; finish OK 0
+fi
+[ "$MODE" = fix ] || { out "[ERROR] Unknown action: $MODE"; finish FAIL 2; }
+[ "$(id -u)" = 0 ] || { out '[ERROR] Guest must run as root'; finish FAIL 2; }
+
+# Snapshot effective SSH policy + config files. Never edit config deliberately.
+TMP=$(mktemp -d /tmp/sshhole-guest.XXXXXXXX) || { out '[ERROR] tmp unavailable'; finish FAIL 2; }
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+config_fingerprints() {
+  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*; do
+    [ -f "$f" ] && sha256sum "$f"
+  done
+}
+auth_snapshot() {
+  "$SSHD" -T > "$1.all" 2>/dev/null || return 1
+  grep -E '^(port|listenaddress|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|usepam|authenticationmethods|authorizedkeysfile|authorizedkeyscommand|authorizedkeyscommanduser|allowusers|denyusers|allowgroups|denygroups|hostbasedauthentication|gssapiauthentication|permittty|chrootdirectory|subsystem|forcecommand|hostkey|hostcertificate|trustedusercakeys|pubkeyacceptedalgorithms) ' "$1.all" | LC_ALL=C sort > "$1"
+  [ -s "$1" ]
+}
+config_fingerprints > "$TMP/config.before"
+before_valid=no
+if "$SSHD" -t >/dev/null 2>&1 && auth_snapshot "$TMP/policy.before"; then
+  before_valid=yes
+else
+  out '[WARN] Pre-upgrade sshd configuration validation failed; will NOT auto-reload'
+fi
+
+# Do not upgrade the entire Alpine installation. Do not rewrite package repositories.
+if [ "$old" = yes ]; then
+  out '[ACTION] apk update + targeted upgrade of preinstalled OpenSSH components'
+  if ! apk update; then out '[ERROR] apk update failed; repositories unchanged'; finish FAIL 2; fi
+  set -- "$pkg"
+  for p in openssh openssh-server-common openssh-server-common-openrc; do
+    if [ "$p" != "$pkg" ] && apk info -e "$p" >/dev/null 2>&1; then set -- "$@" "$p"; fi
+  done
+  # Upgrade existing dependency graph only; no installs or major-version migrations.
+  if ! apk upgrade "$@"; then
+    out '[ERROR] APK upgrade failed; examine package state and logs'; finish FAIL 2
+  fi
+fi
+new=$(version_of "$pkg")
+[ -n "$new" ] || { out '[ERROR] Post-upgrade package version cannot be read'; finish FAIL 2; }
+post_cmp=$(compare "$new" "$min")
+case "$post_cmp" in
+  '>'|'=') out "[OK] $pkg now $new (patched on disk)" ;;
+  *) out "[ERROR] Repo has no verified fix ($pkg=$new, expected >=$min)"; finish FAIL 2 ;;
+esac
+
+config_fingerprints > "$TMP/config.after"
+if ! cmp -s "$TMP/config.before" "$TMP/config.after"; then
+  out '[WARN] sshd config files unexpectedly changed during APK transaction; DO NOT reload; review manually'
+  finish PENDING 4
+fi
+if ! "$SSHD" -t >/dev/null 2>&1; then
+  out '[WARN] Post-upgrade sshd -t failed; DO NOT reload; review manually'
+  finish PENDING 4
+fi
+if [ "$before_valid" = yes ]; then
+  if ! auth_snapshot "$TMP/policy.after" || ! cmp -s "$TMP/policy.before" "$TMP/policy.after"; then
+    out '[WARN] Effective SSH policy changed; DO NOT reload; review manually'
+    finish PENDING 4
+  fi
+fi
+if [ "$RELOAD" = no ] && [ -z "$master_pid" ] && ! pidof sshd >/dev/null 2>&1; then
+  out '[OK] No SSH listener to reload'; finish OK 0
+fi
+if [ "$RELOAD" = no ]; then
+  out '[PENDING] --no-reload: package patched but listening daemon may still be stale'
+  finish PENDING 4
+fi
+if [ -z "$master_pid" ]; then
+  if command -v pidof >/dev/null 2>&1 && pidof sshd >/dev/null 2>&1; then
+    out '[PENDING] sshd running without trusted master pidfile; no signal sent'
+    finish PENDING 4
+  fi
+  out '[OK] sshd is not running (nothing to reload)'; finish OK 0
+fi
+if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = sshd ] && [ "$master_pid" = 1 ]; then
+  out '[PENDING] sshd is PID 1 (application container); refuse SIGHUP to protect container lifecycle'
+  finish PENDING 4
+fi
+if [ "$before_valid" != yes ]; then
+  out '[PENDING] No verified pre-upgrade policy; refused SIGHUP'
+  finish PENDING 4
+fi
+if [ "$old" = no ] && [ "$stale" = no ]; then
+  out '[OK] Patched package and listener already match; no signal necessary'; finish OK 0
+fi
+# Never HUP a custom sshd binary. Re-exec would otherwise reload the wrong binary.
+if command -v readlink >/dev/null 2>&1 && [ -L "/proc/$master_pid/exe" ]; then
+  listener_binary=$(readlink "/proc/$master_pid/exe" 2>/dev/null || true)
+  case "$listener_binary" in
+    "$SSHD"|"$SSHD (deleted)") ;;
+    *) out "[PENDING] SSH listener binary is custom/unexpected: $listener_binary; refuse signal"; finish PENDING 4 ;;
+  esac
+fi
+# OpenSSH documents listener SIGHUP as self re-exec. Existing sessions are generally retained,
+# but this is not an absolute zero-disconnection guarantee, especially under custom supervision.
+out "[ACTION] SIGHUP to verified listener PID $master_pid; no SSH port/auth changes"
+if ! kill -HUP "$master_pid" 2>/dev/null; then
+  out '[PENDING] Could not signal SSH master'; finish PENDING 4
+fi
+sleep 1
+new_pid=''
+for pf in /run/sshd.pid /var/run/sshd.pid; do
+  [ -r "$pf" ] || continue
+  p=$(cat "$pf" 2>/dev/null | tr -d '[:space:]')
+  case "$p" in ''|*[!0-9]*) continue ;; esac
+  if [ -r "/proc/$p/comm" ] && [ "$(cat "/proc/$p/comm" 2>/dev/null)" = sshd ]; then
+    new_pid=$p
+    break
+  fi
+done
+if [ -z "$new_pid" ]; then
+  out '[FAIL] Listener PID disappeared after SIGHUP; recover using VM/provider console'
+  finish FAIL 2
+fi
+if [ -r "/proc/$new_pid/exe" ] && command -v cmp >/dev/null 2>&1 && ! cmp -s "/proc/$new_pid/exe" "$SSHD"; then
+  out '[PENDING] Listener still differs from disk binary after SIGHUP; investigate manually'
+  finish PENDING 4
+fi
+out "[OK] SSH listener re-executed / verified PID=$new_pid; login policy unchanged"
+finish OK 0
+GUEST_WORKER
+}
+
+show_result() {
+  label=$1
+  response=$2
+  rc=$3
+  SUMMARY_TOTAL=$((SUMMARY_TOTAL + 1))
+  say "----- $label -----"
+  # Guest does not print passwords, keys or complete sshd configs.
+  cat "$response" | tee -a "$LOG_FILE"
+  status=$(sed -n 's/^SSHH_RESULT=//p' "$response" | tail -n 1)
+  case "$status" in
+    OK) SUMMARY_OK=$((SUMMARY_OK+1)) ;;
+    RISK) SUMMARY_RISK=$((SUMMARY_RISK+1)) ;;
+    PENDING) SUMMARY_PENDING=$((SUMMARY_PENDING+1)) ;;
+    SKIP) SUMMARY_SKIP=$((SUMMARY_SKIP+1)) ;;
+    *) SUMMARY_FAIL=$((SUMMARY_FAIL+1)); say "[ERROR] execution exit_code=$rc status=${status:-missing}" ;;
+  esac
+}
+
+run_target() {
+  label=$1
+  shift
+  tmp="$WORK/guest-result"
+  : > "$tmp"
+  guest_script | "$@" > "$tmp" 2>&1
+  rc=$?
+  show_result "$label" "$tmp" "$rc"
+}
+
+scan_oci() {
+  engine=$1
+  command -v "$engine" >/dev/null 2>&1 || return 0
+  ids="$WORK/$engine.ids"
+  if ! "$engine" ps --no-trunc --format '{{.ID}}' > "$ids" 2> "$WORK/$engine.err"; then
+    say "[WARN] $engine unavailable / no permission: $(head -n 1 "$WORK/$engine.err")"
+    return 0
+  fi
+  count=$(grep -c . "$ids" || true)
+  say "[INFO] $engine running containers=$count (root-visible daemon/namespace only)"
+  while IFS= read -r id || [ -n "$id" ]; do
+    [ -n "$id" ] || continue
+    name=$("$engine" inspect -f '{{.Name}}' "$id" 2>/dev/null | head -n 1)
+    [ -n "$name" ] || name=$id
+    run_target "$engine:$name" "$engine" exec -u 0 -i "$id" /bin/sh -s -- "$ACTION" "$RELOAD"
+  done < "$ids"
+  say "[WARN] $engine: running container overlay is patched, but persistent image/Dockerfile is NOT patched; rebuild image before recreate/redeploy."
+}
+
+scan_incus_like() {
+  engine=$1
+  command -v "$engine" >/dev/null 2>&1 || return 0
+  projects="$WORK/$engine.projects"
+  # Names only, avoiding dependency on jq/yq; Incus and LXD support -c n csv.
+  if ! "$engine" project list --columns n --format csv,noheader > "$projects" 2> "$WORK/$engine.err"; then
+    say "[WARN] $engine project listing failed; NOT assuming default is exhaustive"
+    return 0
+  fi
+  while IFS= read -r project || [ -n "$project" ]; do
+    [ -n "$project" ] || continue
+    items="$WORK/$engine.items"
+    if ! "$engine" list --project "$project" --columns nts --format csv,noheader > "$items" 2> "$WORK/$engine.err"; then
+      say "[WARN] $engine project=$project list failed; skipped"
+      continue
+    fi
+    # Format: name,type,status. VM types are deliberately ignored.
+    while IFS=, read -r name kind status || [ -n "$name" ]; do
+      [ -n "$name" ] || continue
+      kind_u=$(printf '%s' "$kind" | tr '[:lower:]' '[:upper:]')
+      status_u=$(printf '%s' "$status" | tr '[:lower:]' '[:upper:]')
+      [ "$status_u" = RUNNING ] || continue
+      case "$kind_u" in CONTAINER) ;; *) continue ;; esac
+      run_target "$engine:$project/$name" "$engine" exec --project "$project" "$name" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+    done < "$items"
+  done < "$projects"
+}
+
+scan_runman() {
+  command -v runman-agent >/dev/null 2>&1 || return 0
+  if ! command -v systemctl >/dev/null 2>&1; then
+    say '[WARN] Rust Runman v2 needs systemd; unavailable, skipping Runman runtime'; return 0
+  fi
+  if [ -n "$RUNMAN_DATA_DIR" ]; then
+    dir=$RUNMAN_DATA_DIR
+  else
+    dir=/var/lib/runman-agent
+    conf=/etc/runman-agent/config.toml
+    if [ -r "$conf" ]; then
+      # Toml string-valued data_dir, from Runman v2 config only. No shell evaluation.
+      found=$(sed -n 's/^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*"\([^"[:cntrl:]]*\)".*/\1/p' "$conf" | head -n 1)
+      [ -z "$found" ] || dir=$found
+    fi
+  fi
+  case "$dir" in
+    /*) ;; *) say "[WARN] Invalid Runman data_dir=$dir; skipped"; return 0 ;;
+  esac
+  [ -d "$dir/instances" ] || { say '[INFO] No Rust Runman v2 instance directory'; return 0; }
+  say "[INFO] Rust Runman v2 persistent dir=$dir; using native __exec (not SSH)"
+  count=0
+  for item in "$dir"/instances/*; do
+    [ -d "$item" ] && [ -f "$item/instance.json" ] || continue
+    id=${item##*/}
+    # Only canonical UUID pattern; fail closed on unexpected paths.
+    if ! printf '%s\n' "$id" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+      continue
+    fi
+    unit="runman-$id.service"
+    systemctl is-active --quiet "$unit" 2>/dev/null || continue
+    pidfile="/run/runman-agent/$id/init.pid"
+    [ -r "$pidfile" ] || { say "[WARN] $unit active but init.pid missing; skip"; continue; }
+    pid=$(cat "$pidfile" 2>/dev/null | tr -d '[:space:]')
+    case "$pid" in ''|*[!0-9]*) say "[WARN] invalid Runman PID for $id"; continue ;; esac
+    [ -r "/proc/$pid/cgroup" ] || continue
+    if ! grep -Fq "$unit" "/proc/$pid/cgroup"; then
+      say "[WARN] Runman $id PID does not belong to $unit cgroup; skip"; continue
+    fi
+    count=$((count+1))
+    cg="/sys/fs/cgroup/system.slice/$unit"
+    [ -d "$cg" ] || { say "[WARN] missing cgroup for $id"; continue; }
+    run_target "runman:$id" runman-agent __exec "$pidfile" "$cg" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+  done
+  say "[INFO] Rust Runman v2 running records examined=$count"
+  [ "$count" -eq 0 ] || say "[WARN] Runman: existing guest overlay is patched; rebuild or refresh old base images before new VPS/reinstall."
+}
+
+say "SSHhole All-in-One | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD"
+say "Host OS: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | tr -d '"')"
+say 'Policy: never change SSH auth/port/password/key config; no VM restart; no image rebuild.'
+if [ "$SCOPE" = all ] || [ "$SCOPE" = host ]; then
+  run_target 'host' /bin/sh -s -- "$ACTION" "$RELOAD"
+fi
+if [ "$SCOPE" = all ] || [ "$SCOPE" = containers ]; then
+  if want_engine docker; then scan_oci docker; fi
+  if want_engine podman; then scan_oci podman; fi
+  if want_engine incus; then scan_incus_like incus; fi
+  if want_engine lxd; then scan_incus_like lxc; fi
+  if want_engine runman; then scan_runman; fi
+fi
+say "SUMMARY total=$SUMMARY_TOTAL ok=$SUMMARY_OK vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
+say "Host log: $LOG_FILE"
+if [ "$SUMMARY_FAIL" -gt 0 ]; then exit 2; fi
+if [ "$SUMMARY_RISK" -gt 0 ] || [ "$SUMMARY_PENDING" -gt 0 ]; then exit 3; fi
+exit 0
