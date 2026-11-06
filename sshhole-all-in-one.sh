@@ -3,7 +3,7 @@
 # Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
 # Safe baseline: do not change authentication, users, keys, passwords, ports,
 # SSH daemon config, host firewall, repositories, container lifecycle or images.
-# Authoring date: 2026-11-06. POSIX sh, BusyBox ash compatible.
+# Updated: 2026-11-06 (v1.1). POSIX sh, BusyBox ash compatible.
 set -u
 umask 077
 
@@ -13,6 +13,7 @@ ENGINE=all
 RELOAD=yes
 RUNMAN_DATA_DIR=
 SUMMARY_OK=0
+SUMMARY_SAFE=0
 SUMMARY_RISK=0
 SUMMARY_PENDING=0
 SUMMARY_SKIP=0
@@ -37,6 +38,8 @@ Options:
 
 Host may be Alpine, Debian or Ubuntu. Guest must be Alpine Linux with APK OpenSSH.
 All running instances are examined; stopped instances are never started.
+SAFE means no OpenSSH server is detected (safe against this specific CVE),
+OK means installed OpenSSH reaches the patched threshold. SKIP means out of scope.
 No repository rewrites / full distribution upgrades / user or SSH config changes.
 Uses SIGHUP only on a PID-file-verified SSH listener; if uncertain, leaves a
 PENDING_RELOAD item (the disk is patched but live daemon may still be vulnerable).
@@ -121,7 +124,13 @@ if [ -z "$pkg" ]; then
   if [ -x /usr/sbin/sshd ] || command -v sshd >/dev/null 2>&1; then
     out '[WARN] Non-APK or unknown sshd; will not replace a custom SSH installation'; finish FAIL 2
   fi
-  out '[SKIP] No OpenSSH server installed'; finish SKIP 0
+  # An untracked sshd process could be a manually-installed OpenSSH daemon.
+  if command -v pidof >/dev/null 2>&1 && pidof sshd >/dev/null 2>&1; then
+    out '[WARN] sshd is running but no OpenSSH APK server is installed; unknown binary, manual review needed'
+    finish FAIL 2
+  fi
+  out '[SAFE] No OpenSSH server installed; not affected by this SSHhole OpenSSH vulnerability'
+  finish SAFE 0
 fi
 version_of() {
   apk info -v "$1" 2>/dev/null | awk -v pre="$1-" 'index($0,pre)==1 {print substr($0,length(pre)+1);exit}'
@@ -222,6 +231,7 @@ if [ "$old" = yes ]; then
   if ! apk upgrade "$@"; then
     out '[ERROR] APK upgrade failed; examine package state and logs'; finish FAIL 2
   fi
+  out 'SSHH_PACKAGE_UPDATED=yes'
 fi
 new=$(version_of "$pkg")
 [ -n "$new" ] || { out '[ERROR] Post-upgrade package version cannot be read'; finish FAIL 2; }
@@ -320,6 +330,7 @@ show_result() {
   status=$(sed -n 's/^SSHH_RESULT=//p' "$response" | tail -n 1)
   case "$status" in
     OK) SUMMARY_OK=$((SUMMARY_OK+1)) ;;
+    SAFE) SUMMARY_SAFE=$((SUMMARY_SAFE+1)) ;;
     RISK) SUMMARY_RISK=$((SUMMARY_RISK+1)) ;;
     PENDING) SUMMARY_PENDING=$((SUMMARY_PENDING+1)) ;;
     SKIP) SUMMARY_SKIP=$((SUMMARY_SKIP+1)) ;;
@@ -347,13 +358,19 @@ scan_oci() {
   fi
   count=$(grep -c . "$ids" || true)
   say "[INFO] $engine running containers=$count (root-visible daemon/namespace only)"
+  image_update_needed=no
   while IFS= read -r id || [ -n "$id" ]; do
     [ -n "$id" ] || continue
     name=$("$engine" inspect -f '{{.Name}}' "$id" 2>/dev/null | head -n 1)
     [ -n "$name" ] || name=$id
     run_target "$engine:$name" "$engine" exec -u 0 -i "$id" /bin/sh -s -- "$ACTION" "$RELOAD"
+    if grep -qx 'SSHH_PACKAGE_UPDATED=yes' "$WORK/guest-result"; then
+      image_update_needed=yes
+    fi
   done < "$ids"
-  say "[WARN] $engine: running container overlay is patched, but persistent image/Dockerfile is NOT patched; rebuild image before recreate/redeploy."
+  if [ "$image_update_needed" = yes ]; then
+    say "[WARN] $engine: OpenSSH was upgraded inside running container(s); original image/Dockerfile may still be vulnerable. Update image before re-create/redeploy."
+  fi
 }
 
 scan_incus_like() {
@@ -406,6 +423,7 @@ scan_runman() {
   [ -d "$dir/instances" ] || { say '[INFO] No Rust Runman v2 instance directory'; return 0; }
   say "[INFO] Rust Runman v2 persistent dir=$dir; using native __exec (not SSH)"
   count=0
+  image_update_needed=no
   for item in "$dir"/instances/*; do
     [ -d "$item" ] && [ -f "$item/instance.json" ] || continue
     id=${item##*/}
@@ -427,9 +445,14 @@ scan_runman() {
     cg="/sys/fs/cgroup/system.slice/$unit"
     [ -d "$cg" ] || { say "[WARN] missing cgroup for $id"; continue; }
     run_target "runman:$id" runman-agent __exec "$pidfile" "$cg" -- /bin/sh -s -- "$ACTION" "$RELOAD"
+    if grep -qx 'SSHH_PACKAGE_UPDATED=yes' "$WORK/guest-result"; then
+      image_update_needed=yes
+    fi
   done
   say "[INFO] Rust Runman v2 running records examined=$count"
-  [ "$count" -eq 0 ] || say "[WARN] Runman: existing guest overlay is patched; rebuild or refresh old base images before new VPS/reinstall."
+  if [ "$image_update_needed" = yes ]; then
+    say '[WARN] Runman: OpenSSH was upgraded in existing guest(s). Refresh Alpine base images before new VPS/reinstall.'
+  fi
 }
 
 say "SSHhole All-in-One | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD"
@@ -445,7 +468,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = containers ]; then
   if want_engine lxd; then scan_incus_like lxc; fi
   if want_engine runman; then scan_runman; fi
 fi
-say "SUMMARY total=$SUMMARY_TOTAL ok=$SUMMARY_OK vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
+say "SUMMARY total=$SUMMARY_TOTAL safe=$SUMMARY_SAFE ok=$SUMMARY_OK vulnerable=$SUMMARY_RISK pending_reload=$SUMMARY_PENDING skipped=$SUMMARY_SKIP failed=$SUMMARY_FAIL"
 say "Host log: $LOG_FILE"
 if [ "$SUMMARY_FAIL" -gt 0 ]; then exit 2; fi
 if [ "$SUMMARY_RISK" -gt 0 ] || [ "$SUMMARY_PENDING" -gt 0 ]; then exit 3; fi
