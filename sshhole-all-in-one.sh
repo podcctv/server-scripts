@@ -3,7 +3,7 @@
 # Supported managers: Docker, Podman, Incus, LXD, Rust Runman v2.
 # Safe baseline: do not change authentication, users, keys, passwords, ports,
 # SSH daemon config, host firewall, repositories, container lifecycle or images.
-# Updated: 2026-11-06 (v1.2). POSIX sh, BusyBox ash compatible.
+# Updated: 2026-11-06 (v1.3). POSIX sh, BusyBox ash compatible.
 set -u
 umask 077
 
@@ -148,11 +148,61 @@ if [ -z "$pkg" ]; then
   out '[SAFE] No OpenSSH server installed; not affected by this SSHhole OpenSSH vulnerability'
   finish SAFE 0
 fi
+# Alpine 3.23+ uses apk-tools v3: `apk info -v PKG` is NOT a stable way
+# to obtain the installed version across apk v2 / v3. Read the installed DB
+# first (v2 text DB still used by v3.23), then try the installed-package list.
+# Never use apk policy/search here: they also show AVAILABLE repository versions.
+parse_installed_list() {
+  awk -v pre="$1-" '
+    {
+      entry=$1
+      if (substr(entry,1,length(pre)) == pre) {
+        v=substr(entry,length(pre)+1)
+        if (v ~ /^[0-9][0-9A-Za-z._-]*$/) {print v; exit}
+      }
+    }
+  '
+}
+version_from_db() {
+  [ -r /lib/apk/db/installed ] || return 1
+  awk -v want="$1" '
+    /^P:/ { name=substr($0,3); next }
+    /^V:/ { if (name==want) { print substr($0,3); exit } }
+    /^$/ { name="" }
+  ' /lib/apk/db/installed
+}
 version_of() {
-  apk info -v "$1" 2>/dev/null | awk -v pre="$1-" 'index($0,pre)==1 {print substr($0,length(pre)+1);exit}'
+  pkgname=$1
+  # DB is local and authoritative; no network or repository cache needed.
+  from_db=$(version_from_db "$pkgname" 2>/dev/null || true)
+  if [ -n "$from_db" ]; then
+    printf '%s\n' "$from_db"
+    return 0
+  fi
+  from_list=$(apk list --installed "$pkgname" 2>/dev/null | parse_installed_list "$pkgname")
+  if [ -n "$from_list" ]; then
+    printf '%s\n' "$from_list"
+    return 0
+  fi
+  # Compatibility fallback for older apk-tools and trimmed databases.
+  from_info=$(apk info -a "$pkgname" 2>/dev/null | parse_installed_list "$pkgname")
+  if [ -n "$from_info" ]; then
+    printf '%s\n' "$from_info"
+    return 0
+  fi
+  apk info -v "$pkgname" 2>/dev/null | parse_installed_list "$pkgname"
 }
 ver=$(version_of "$pkg")
-[ -n "$ver" ] || { out '[ERROR] Could not read installed APK version'; finish FAIL 2; }
+if [ -z "$ver" ]; then
+  out '[ERROR] Installed OpenSSH APK detected, but installed version could not be determined by APK database/list/info'
+  out "[DIAG] apk_tools=$(apk --version 2>/dev/null | head -n 1)"
+  if [ -r /lib/apk/db/installed ]; then
+    out '[DIAG] /lib/apk/db/installed is readable'
+  else
+    out '[DIAG] /lib/apk/db/installed unavailable; tried apk list and apk info'
+  fi
+  finish FAIL 2
+fi
 compare() {
   apk version -t "$1" "$2" 2>/dev/null | tr -d '[:space:]'
 }
@@ -611,7 +661,7 @@ render_summary() {
   say "Host log: $LOG_FILE"
 }
 
-say "SSHhole All-in-One v1.2 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE"
+say "SSHhole All-in-One v1.3 | action=$ACTION scope=$SCOPE engine=$ENGINE reload=$RELOAD color=$COLOR_MODE"
 say "Host OS: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | tr -d '"')"
 say 'Policy: never change SSH auth/port/password/key config; no VM restart; no image rebuild.'
 if [ "$SCOPE" = all ] || [ "$SCOPE" = host ]; then
